@@ -34,12 +34,14 @@ message from their resume plus the job description, ready to copy and send.
 Grouped by day, so opening "7 August" shows that day's requests
 (e.g. 7 DMs + 4 emails = 11) in one place.
 
-## Planned endpoints
+## Endpoints
 
 ```
 GET    /me                        profile + "My Kit" answers
 PUT    /me/kit                    update kit
-POST   /me/resume                 upload base resume, returns parsed profile
+GET    /resumes/base              current base resume metadata
+POST   /resumes                   upload and parse a base resume
+POST   /resumes/:id/autofill      fill blank kit fields from parsed resume
 
 GET    /portals                   connected portals + counts
 PUT    /portals/:id               connect / disconnect
