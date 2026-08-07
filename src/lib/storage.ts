@@ -73,6 +73,18 @@ export async function uploadObject(params: {
     throw serviceUnavailable(`Could not store the file: ${error.message}`)
   }
 }
+export async function downloadObject(key: string): Promise<Buffer> {
+  const { data, error } = await getClient()
+    .storage.from(env.SUPABASE_STORAGE_BUCKET)
+    .download(key)
+
+  if (error || !data) {
+    logger.error({ err: error, key }, 'supabase storage download failed')
+    throw serviceUnavailable(`Could not read the stored file: ${error?.message ?? 'unknown'}`)
+  }
+  return Buffer.from(await data.arrayBuffer())
+}
+
 
 export async function createSignedUrl(
   key: string,

@@ -6,7 +6,14 @@ import { resumes, type Resume } from '../../db/schema.js'
 import { badRequest, conflict, notFound } from '../../lib/errors.js'
 import { asyncHandler, created, noContent, ok, pathParam } from '../../lib/http.js'
 import { logger } from '../../lib/logger.js'
-import { buildObjectKey, createSignedUrl, removeObject, storageConfigured, uploadObject } from '../../lib/storage.js'
+import {
+  buildObjectKey,
+  createSignedUrl,
+  downloadObject,
+  removeObject,
+  storageConfigured,
+  uploadObject,
+} from '../../lib/storage.js'
 import { currentUser, requireAuth } from '../../middleware/auth.js'
 import { resumeUpload } from '../../middleware/upload.js'
 import { validate } from '../../middleware/validate.js'
@@ -55,8 +62,49 @@ function serializeResume(row: Resume): ResumeDto {
     parsedTitles: row.parsedTitles,
     parsedYearsExperience: row.parsedYearsExperience,
     parseError: row.parseError,
-    autofillAvailable: row.parseStatus === 'parsed' && readParsedResume(row.parsedProfile) !== null,
+    autofillAvailable:
+      row.isBase && (row.parseStatus !== 'failed' || readParsedResume(row.parsedProfile) !== null),
     uploadedAt: row.createdAt.toISOString(),
+  }
+}
+async function parseAndStoreResume(row: Resume, buffer: Buffer): Promise<Resume> {
+  const parser = getResumeParser()
+  try {
+    const parsed = await parser.parse({
+      resumeId: row.id,
+      userId: row.userId,
+      fileName: row.fileName,
+      mimeType: row.mimeType,
+      storagePath: row.storagePath,
+      buffer,
+    })
+    const [updated] = await db
+      .update(resumes)
+      .set({
+        parseStatus: 'parsed',
+        parsedAt: new Date(),
+        parseError: null,
+        parsedProfile: parsed,
+        parsedSkills: parsed.skills,
+        parsedTitles: parsed.titles,
+        parsedYearsExperience: parsed.yearsExperience,
+        updatedAt: new Date(),
+      })
+      .where(eq(resumes.id, row.id))
+      .returning()
+    return updated ?? row
+  } catch (error) {
+    logger.error({ err: error, resumeId: row.id }, 'resume parse failed')
+    const [updated] = await db
+      .update(resumes)
+      .set({
+        parseStatus: 'failed',
+        parseError: error instanceof Error ? error.message : String(error),
+        updatedAt: new Date(),
+      })
+      .where(eq(resumes.id, row.id))
+      .returning()
+    return updated ?? row
   }
 }
 
@@ -147,46 +195,7 @@ resumesRouter.post(
       throw error
     }
 
-    const parser = getResumeParser()
-    try {
-      const parsed = await parser.parse({
-        resumeId: row.id,
-        userId: auth.id,
-        fileName: file.originalname,
-        mimeType: file.mimetype,
-        storagePath: key,
-        buffer: file.buffer,
-      })
-
-      const [updated] = await db
-        .update(resumes)
-        .set({
-          parseStatus: 'parsed',
-          parsedAt: new Date(),
-          parsedProfile: parsed,
-          parsedSkills: parsed.skills,
-          parsedTitles: parsed.titles,
-          parsedYearsExperience: parsed.yearsExperience,
-          updatedAt: new Date(),
-        })
-        .where(eq(resumes.id, row.id))
-        .returning()
-
-      if (updated) row = updated
-
-    } catch (error) {
-      logger.error({ err: error, resumeId: row.id }, 'resume parse failed')
-      const [updated] = await db
-        .update(resumes)
-        .set({
-          parseStatus: 'failed',
-          parseError: error instanceof Error ? error.message : String(error),
-          updatedAt: new Date(),
-        })
-        .where(eq(resumes.id, row.id))
-        .returning()
-      if (updated) row = updated
-    }
+    row = await parseAndStoreResume(row, file.buffer)
 
     await recordActivity({
       userId: auth.id,
@@ -205,18 +214,20 @@ resumesRouter.post(
   validate({ params: idParamSchema }),
   asyncHandler(async (req, res) => {
     const auth = currentUser(req)
-    const [row] = await db
+    let [row] = await db
       .select()
       .from(resumes)
       .where(and(eq(resumes.id, pathParam(req, 'id')), eq(resumes.userId, auth.id)))
       .limit(1)
     if (!row) throw notFound('Resume not found')
-    if (row.parseStatus === 'failed') {
+    let profile = readParsedResume(row.parsedProfile)
+    if (!profile) {
+      row = await parseAndStoreResume(row, await downloadObject(row.storagePath))
+      profile = readParsedResume(row.parsedProfile)
+    }
+    if (!profile) {
       throw conflict(row.parseError || 'This resume could not be parsed. Upload a PDF or DOCX.')
     }
-
-    const profile = readParsedResume(row.parsedProfile)
-    if (!profile) throw conflict('This resume is still being parsed. Try again shortly.')
 
     const result = await applyResumeAutofill(auth.id, profile)
     ok(res, {
