@@ -1,0 +1,25 @@
+{
+  "name": "job-hunters-scraper-spike",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Throwaway spike: can we sweep job portals daily and keep only the last 24h of postings?",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "tsx src/run.ts",
+    "sweep": "tsx src/run.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "fast-xml-parser": "^4.5.1",
+    "undici": "^7.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
