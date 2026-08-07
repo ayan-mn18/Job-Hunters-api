@@ -1,0 +1,16 @@
+{
+  "name": "job-hunters-resume-render-experiment",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Renders a ResumeDocument to PDF two ways and measures which one parses back cleanly.",
+  "scripts": {
+    "experiment": "node src/run.mjs",
+    "render:ats": "node src/render.mjs ats",
+    "render:pretty": "node src/render.mjs pretty",
+    "check": "node src/check.mjs"
+  },
+  "dependencies": {
+    "unpdf": "^1.8.0"
+  }
+}

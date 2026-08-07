@@ -1,0 +1,114 @@
+{
+  "id": "rd_sample_001",
+  "version": 3,
+  "locale": "en-IN",
+  "basics": {
+    "fullName": "Ayan Mansoori",
+    "headline": "Full-stack Engineer",
+    "email": "ayan.mansoori@example.com",
+    "phone": "+91 98765 43210",
+    "location": { "city": "Pune", "region": "Maharashtra", "country": "India" },
+    "links": [
+      { "label": "LinkedIn", "url": "https://linkedin.com/in/ayan-mn18" },
+      { "label": "GitHub", "url": "https://github.com/ayan-mn18" }
+    ]
+  },
+  "summary": {
+    "id": "sum_1",
+    "text": "Full-stack engineer with 4 years building React and Node.js products in payments and platform teams. Owned a billing rewrite end to end and cut p95 checkout latency by 38%."
+  },
+  "experience": [
+    {
+      "id": "exp_nimbus",
+      "company": "Nimbus Labs",
+      "role": "Software Engineer",
+      "location": "Remote, India",
+      "startDate": "2024-01",
+      "endDate": null,
+      "bullets": [
+        {
+          "id": "b_nim_1",
+          "text": "Rewrote the billing service in Node.js and PostgreSQL, replacing a Rails monolith path that handled 40k invoices a month.",
+          "skills": ["Node.js", "PostgreSQL", "TypeScript"],
+          "metrics": ["40k invoices/month"]
+        },
+        {
+          "id": "b_nim_2",
+          "text": "Cut p95 checkout latency from 1.9s to 1.2s by adding Redis read-through caching and removing three N+1 queries.",
+          "skills": ["Redis", "PostgreSQL", "Performance"],
+          "metrics": ["p95 1.9s to 1.2s"]
+        },
+        {
+          "id": "b_nim_3",
+          "text": "Built the React 19 admin console used by 60 internal operators, including an audit log and role-based access control.",
+          "skills": ["React", "TypeScript", "RBAC"],
+          "metrics": ["60 operators"]
+        },
+        {
+          "id": "b_nim_4",
+          "text": "Set up GitHub Actions CI with typecheck, unit and Playwright end-to-end stages, taking the median PR feedback loop to 6 minutes.",
+          "skills": ["CI/CD", "GitHub Actions", "Playwright"],
+          "metrics": ["6 minute PR feedback"]
+        }
+      ]
+    },
+    {
+      "id": "exp_pastel",
+      "company": "Pastel Pay",
+      "role": "Junior Developer",
+      "location": "Bengaluru, India",
+      "startDate": "2022-06",
+      "endDate": "2023-12",
+      "bullets": [
+        {
+          "id": "b_pas_1",
+          "text": "Shipped the merchant payments dashboard in React and GraphQL, used daily by 1,200 merchants to reconcile settlements.",
+          "skills": ["React", "GraphQL"],
+          "metrics": ["1,200 merchants"]
+        },
+        {
+          "id": "b_pas_2",
+          "text": "Containerised eight internal services with Docker and moved deploys from manual SSH to a single AWS ECS pipeline.",
+          "skills": ["Docker", "AWS", "ECS"],
+          "metrics": ["8 services"]
+        },
+        {
+          "id": "b_pas_3",
+          "text": "Carried the on-call pager for the settlements service and wrote the runbooks that cut mean time to acknowledge to 4 minutes.",
+          "skills": ["On-call", "Incident response"],
+          "metrics": ["MTTA 4 minutes"]
+        }
+      ]
+    }
+  ],
+  "education": [
+    {
+      "id": "edu_1",
+      "institution": "Savitribai Phule Pune University",
+      "credential": "B.E. Computer Engineering",
+      "startDate": "2018-08",
+      "endDate": "2022-05",
+      "detail": "CGPA 8.4/10"
+    }
+  ],
+  "skills": [
+    { "id": "sk_react", "name": "React", "category": "Frontend", "yearsUsed": 4 },
+    { "id": "sk_ts", "name": "TypeScript", "category": "Languages", "yearsUsed": 4 },
+    { "id": "sk_node", "name": "Node.js", "category": "Backend", "yearsUsed": 4 },
+    { "id": "sk_pg", "name": "PostgreSQL", "category": "Data", "yearsUsed": 4 },
+    { "id": "sk_redis", "name": "Redis", "category": "Data", "yearsUsed": 2 },
+    { "id": "sk_aws", "name": "AWS", "category": "Infrastructure", "yearsUsed": 3 },
+    { "id": "sk_docker", "name": "Docker", "category": "Infrastructure", "yearsUsed": 3 },
+    { "id": "sk_gql", "name": "GraphQL", "category": "Backend", "yearsUsed": 2 },
+    { "id": "sk_cicd", "name": "CI/CD", "category": "Infrastructure", "yearsUsed": 3 },
+    { "id": "sk_pw", "name": "Playwright", "category": "Testing", "yearsUsed": 2 }
+  ],
+  "projects": [
+    {
+      "id": "prj_1",
+      "name": "Job Hunters",
+      "url": "https://github.com/ayan-mn18/Job-Hunters-api",
+      "description": "Daily pipeline that scrapes job portals, scores postings against a structured profile and renders a tailored resume per job description."
+    }
+  ]
+}
