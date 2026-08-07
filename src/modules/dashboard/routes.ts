@@ -1,4 +1,4 @@
-import { and, count, desc, eq, sql } from 'drizzle-orm'
+import { and, count, desc, eq, gte, lte, or, sql } from 'drizzle-orm'
 import { Router } from 'express'
 import { z } from 'zod'
 import { db } from '../../db/client.js'
@@ -6,6 +6,11 @@ import {
   activityEvents,
   applications,
   huntSpecs,
+  huntCandidates,
+  huntRunJobs,
+  huntRuns,
+  jobSources,
+  jobs,
   referrals,
   userPortals,
 } from '../../db/schema.js'
@@ -21,6 +26,11 @@ dashboardRouter.use(requireAuth)
 const querySchema = z.object({
   activityLimit: z.coerce.number().int().min(1).max(50).default(8),
   recentApplications: z.coerce.number().int().min(1).max(20).default(4),
+})
+
+const jobsQuerySchema = z.object({
+  runId: z.string().uuid().optional(),
+  limit: z.coerce.number().int().min(1).max(1000).default(500),
 })
 
 /**
@@ -220,5 +230,121 @@ dashboardRouter.get(
       })),
       { total: totalRow?.value ?? 0, limit, offset },
     )
+  }),
+)
+
+dashboardRouter.get(
+  '/jobs',
+  validate({ query: jobsQuerySchema }),
+  asyncHandler(async (req, res) => {
+    const auth = currentUser(req)
+    const query = validatedQuery<z.infer<typeof jobsQuerySchema>>(req)
+    const runWhere = query.runId
+      ? and(eq(huntRuns.id, query.runId), eq(huntRuns.userId, auth.id))
+      : eq(huntRuns.userId, auth.id)
+    const [run] = await db
+      .select()
+      .from(huntRuns)
+      .where(runWhere)
+      .orderBy(desc(huntRuns.createdAt))
+      .limit(1)
+
+    if (!run) {
+      ok(res, { run: null, counts: { all: 0 }, portals: {}, items: [], historical: false })
+      return
+    }
+
+    const detailed = await db
+      .select({ runJob: huntRunJobs, job: jobs, candidateStatus: huntCandidates.status })
+      .from(huntRunJobs)
+      .innerJoin(jobs, eq(huntRunJobs.jobId, jobs.id))
+      .leftJoin(
+        huntCandidates,
+        and(eq(huntCandidates.runId, huntRunJobs.runId), eq(huntCandidates.jobId, huntRunJobs.jobId)),
+      )
+      .where(and(eq(huntRunJobs.runId, run.id), eq(huntRunJobs.userId, auth.id)))
+      .orderBy(desc(huntRunJobs.score), desc(jobs.postedAt))
+      .limit(query.limit)
+
+    let historical = false
+    let items = detailed.map(({ runJob, job, candidateStatus }) => ({
+      id: runJob.id,
+      jobId: job.id,
+      title: job.title,
+      company: job.company,
+      locations: job.locations,
+      remote: job.remoteMode,
+      sourcePortal: runJob.sourcePortal,
+      status: runJob.status,
+      candidateStatus,
+      score: runJob.score,
+      reasons: runJob.reasons,
+      skills: job.skills,
+      descriptionPreview: (job.descriptionText ?? '').slice(0, 600),
+      jobUrl: job.canonicalUrl,
+      applyUrl: job.applyUrl,
+      postedAt: job.postedAt.toISOString(),
+      discoveredAt: runJob.discoveredAt.toISOString(),
+    }))
+
+    if (items.length === 0) {
+      historical = true
+      const windowStart = run.startedAt ?? run.createdAt
+      const windowEnd = run.finishedAt ?? new Date()
+      const fallback = await db
+        .select({ job: jobs, source: jobSources })
+        .from(jobSources)
+        .innerJoin(jobs, eq(jobSources.jobId, jobs.id))
+        .where(or(
+          and(gte(jobSources.fetchedAt, windowStart), lte(jobSources.fetchedAt, windowEnd)),
+          and(gte(jobs.createdAt, windowStart), lte(jobs.createdAt, windowEnd)),
+        ))
+        .orderBy(desc(jobs.postedAt))
+        .limit(query.limit * 2)
+      const unique = new Map<string, (typeof fallback)[number]>()
+      for (const row of fallback) if (!unique.has(row.job.id)) unique.set(row.job.id, row)
+      items = [...unique.values()].slice(0, query.limit).map(({ job, source }) => ({
+        id: `historical:${run.id}:${job.id}`,
+        jobId: job.id,
+        title: job.title,
+        company: job.company,
+        locations: job.locations,
+        remote: job.remoteMode,
+        sourcePortal: source.portalId,
+        status: 'scraped' as const,
+        candidateStatus: null,
+        score: null,
+        reasons: ['Historical run predates detailed status tracking.'],
+        skills: job.skills,
+        descriptionPreview: (job.descriptionText ?? '').slice(0, 600),
+        jobUrl: job.canonicalUrl,
+        applyUrl: job.applyUrl,
+        postedAt: job.postedAt.toISOString(),
+        discoveredAt: source.fetchedAt.toISOString(),
+      }))
+    }
+
+    const counts: Record<string, number> = { all: items.length }
+    const portals: Record<string, number> = {}
+    for (const item of items) {
+      counts[item.status] = (counts[item.status] ?? 0) + 1
+      portals[item.sourcePortal] = (portals[item.sourcePortal] ?? 0) + 1
+    }
+
+    ok(res, {
+      run: {
+        id: run.id,
+        status: run.status,
+        jobsScraped: run.jobsScraped,
+        jobsScored: run.jobsScored,
+        applicationsSubmitted: run.applicationsSubmitted,
+        startedAt: run.startedAt?.toISOString() ?? null,
+        finishedAt: run.finishedAt?.toISOString() ?? null,
+      },
+      counts,
+      portals,
+      items,
+      historical,
+    })
   }),
 )

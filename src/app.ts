@@ -13,6 +13,7 @@ import { healthRouter } from './modules/health/routes.js'
 import { huntRouter } from './modules/hunt/routes.js'
 import { meRouter } from './modules/me/routes.js'
 import { portalsRouter } from './modules/portals/routes.js'
+import { portalAccountsRouter } from './modules/portal-accounts/routes.js'
 import { referralsRouter } from './modules/referrals/routes.js'
 import { resumesRouter } from './modules/resumes/routes.js'
 
@@ -83,6 +84,7 @@ export function createApp(): Express {
   app.use('/me', meRouter)
   app.use('/resumes', resumesRouter)
   app.use('/portals', portalsRouter)
+  app.use('/portal-accounts', portalAccountsRouter)
   app.use('/hunt', huntRouter)
   app.use('/applications', applicationsRouter)
   app.use('/referrals', referralsRouter)

@@ -1,8 +1,13 @@
 import { Router } from 'express'
-import { env, hasDatabase, hasSupabaseStorage } from '../../config/env.js'
+import {
+  env,
+  hasDatabase,
+  hasPortalCredentialVault,
+  hasRedis,
+  hasSupabaseStorage,
+} from '../../config/env.js'
 import { pingDatabase } from '../../db/client.js'
 import { asyncHandler } from '../../lib/http.js'
-import { getHuntQueue } from '../../services/hunt-queue.js'
 import { getReferralDraftGenerator } from '../../services/referral-draft.js'
 import { getResumeParser } from '../../services/resume-parser.js'
 
@@ -35,7 +40,6 @@ healthRouter.get(
     const database = await pingDatabase()
     const parser = getResumeParser()
     const draftGenerator = getReferralDraftGenerator()
-    const huntQueue = getHuntQueue()
 
     const ready = database.ok
 
@@ -51,11 +55,17 @@ healthRouter.get(
           configured: hasSupabaseStorage,
           bucket: env.SUPABASE_STORAGE_BUCKET,
         },
+        queue: { configured: hasRedis },
+        portalCredentialVault: { configured: hasPortalCredentialVault },
+        portalAutomation: {
+          enabled: env.PORTAL_AUTOMATION_ENABLED,
+          chromiumConfigured: Boolean(env.CHROMIUM_EXECUTABLE_PATH),
+        },
       },
       stubs: {
         resumeParser: { name: parser.name, implemented: parser.isReal },
         referralDraftGenerator: { name: draftGenerator.name, implemented: draftGenerator.isReal },
-        huntQueue: { name: huntQueue.name, implemented: huntQueue.isReal },
+        huntPipeline: { implemented: true, queueConfigured: hasRedis },
       },
       timestamp: new Date().toISOString(),
     })

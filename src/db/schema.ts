@@ -44,6 +44,9 @@ export const applicationStatusEnum = pgEnum('application_status', [
   'viewed',
   'interview',
   'rejected',
+  'needs_review',
+  'failed',
+  'closed',
 ])
 
 export const referralSourceEnum = pgEnum('referral_source', ['linkedin', 'email'])
@@ -60,8 +63,57 @@ export const resumeParseStatusEnum = pgEnum('resume_parse_status', [
 export const huntRunStatusEnum = pgEnum('hunt_run_status', [
   'queued',
   'running',
+  'awaiting_approval',
+  'applying',
+  'paused',
   'stopped',
   'completed',
+  'failed',
+])
+
+export const huntCandidateStatusEnum = pgEnum('hunt_candidate_status', [
+  'discovered',
+  'approved',
+  'rejected',
+  'tailored',
+  'queued',
+  'applying',
+  'applied',
+  'needs_review',
+  'failed',
+])
+
+export const huntRunJobStatusEnum = pgEnum('hunt_run_job_status', [
+  'scraped',
+  'eligible',
+  'below_threshold',
+  'deal_breaker',
+  'approved',
+  'rejected',
+  'queued',
+  'tailored',
+  'applying',
+  'applied',
+  'needs_review',
+  'failed',
+  'closed',
+])
+
+export const portalAccountStatusEnum = pgEnum('portal_account_status', [
+  'absent',
+  'provisioning',
+  'pending_verification',
+  'ready',
+  'blocked',
+  'failed',
+])
+
+export const applyAttemptStatusEnum = pgEnum('apply_attempt_status', [
+  'pending',
+  'submitting',
+  'submitted',
+  'needs_review',
+  'unknown',
   'failed',
 ])
 
@@ -173,6 +225,11 @@ export const kits = pgTable('kits', {
   expectedCtc: text('expected_ctc'),
   workAuthorization: text('work_authorization'),
   willingToRelocate: text('willing_to_relocate'),
+  /** Private Supabase object used only for supported portal profiles. */
+  photoStoragePath: text('photo_storage_path'),
+  photoFileName: text('photo_file_name'),
+  photoMimeType: text('photo_mime_type'),
+
 
   skills: text('skills').array().notNull().default(sql`'{}'::text[]`),
 
@@ -246,6 +303,10 @@ export const resumes = pgTable(
     parsedSkills: text('parsed_skills').array().notNull().default(sql`'{}'::text[]`),
     parsedTitles: text('parsed_titles').array().notNull().default(sql`'{}'::text[]`),
     parsedYearsExperience: smallint('parsed_years_experience'),
+    /** Canonical user-editable resume structure used by portal profiles and tailoring. */
+    structuredDocument: jsonb('structured_document'),
+    structuredVersion: integer('structured_version').notNull().default(1),
+    structuredConfirmedAt: timestamp('structured_confirmed_at', { withTimezone: true }),
 
     /** For variants: the base resume this was tailored from. */
     derivedFromResumeId: uuid('derived_from_resume_id'),
@@ -314,7 +375,7 @@ export const huntSpecs = pgTable('hunt_specs', {
   locations: text('locations').array().notNull().default(sql`'{}'::text[]`),
   dealBreakers: text('deal_breakers').array().notNull().default(sql`'{}'::text[]`),
   minMatchScore: smallint('min_match_score').notNull().default(70),
-  dailyTarget: smallint('daily_target').notNull().default(50),
+  dailyTarget: smallint('daily_target').notNull().default(100),
   /** Master switch: false pauses the scheduled morning run. */
   isActive: boolean('is_active').notNull().default(true),
   ...timestamps,
@@ -340,12 +401,185 @@ export const huntRuns = pgTable(
     jobsScraped: integer('jobs_scraped').notNull().default(0),
     jobsScored: integer('jobs_scored').notNull().default(0),
     applicationsSubmitted: integer('applications_submitted').notNull().default(0),
+    candidatesApproved: integer('candidates_approved').notNull().default(0),
+    applicationsNeedsReview: integer('applications_needs_review').notNull().default(0),
+    approvalRequired: boolean('approval_required').notNull().default(true),
+    approvedAt: timestamp('approved_at', { withTimezone: true }),
     /** Free-form worker breadcrumb, e.g. { step: "tailor", portal: "linkedin" }. */
     progress: jsonb('progress'),
     error: text('error'),
     ...timestamps,
   },
   (table) => [index('hunt_runs_user_idx').on(table.userId, table.createdAt)],
+)
+
+/* ----------------------------------------------------------- hunt pipeline */
+
+export const jobs = pgTable(
+  'jobs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    fingerprint: text('fingerprint').notNull(),
+    title: text('title').notNull(),
+    company: text('company').notNull(),
+    locations: jsonb('locations').notNull(),
+    remoteMode: text('remote_mode').notNull().default('unknown'),
+    descriptionText: text('description_text'),
+    descriptionHash: text('description_hash'),
+    canonicalUrl: text('canonical_url').notNull(),
+    applyUrl: text('apply_url'),
+    postedAt: timestamp('posted_at', { withTimezone: true }).notNull(),
+    postedAtPrecision: text('posted_at_precision').notNull(),
+    skills: text('skills').array().notNull().default(sql`'{}'::text[]`),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex('jobs_fingerprint_idx').on(table.fingerprint),
+    index('jobs_posted_idx').on(table.postedAt),
+  ],
+)
+
+export const jobSources = pgTable(
+  'job_sources',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    jobId: uuid('job_id')
+      .notNull()
+      .references(() => jobs.id, { onDelete: 'cascade' }),
+    portalId: text('portal_id').notNull(),
+    sourceId: text('source_id').notNull(),
+    sourceUrl: text('source_url').notNull(),
+    applyUrl: text('apply_url'),
+    raw: jsonb('raw'),
+    fetchedAt: timestamp('fetched_at', { withTimezone: true }).notNull().default(now),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex('job_sources_portal_source_idx').on(table.portalId, table.sourceId),
+    index('job_sources_job_idx').on(table.jobId),
+  ],
+)
+
+export const huntRunJobs = pgTable(
+  'hunt_run_jobs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    runId: uuid('run_id')
+      .notNull()
+      .references(() => huntRuns.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    jobId: uuid('job_id')
+      .notNull()
+      .references(() => jobs.id, { onDelete: 'cascade' }),
+    sourcePortal: text('source_portal').notNull(),
+    status: huntRunJobStatusEnum('status').notNull().default('scraped'),
+    score: smallint('score'),
+    scoreBreakdown: jsonb('score_breakdown'),
+    reasons: text('reasons').array().notNull().default(sql`'{}'::text[]`),
+    discoveredAt: timestamp('discovered_at', { withTimezone: true }).notNull().default(now),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex('hunt_run_jobs_run_job_idx').on(table.runId, table.jobId),
+    index('hunt_run_jobs_user_status_idx').on(table.userId, table.status),
+    index('hunt_run_jobs_run_portal_idx').on(table.runId, table.sourcePortal),
+  ],
+)
+
+export const huntCandidates = pgTable(
+  'hunt_candidates',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    runId: uuid('run_id')
+      .notNull()
+      .references(() => huntRuns.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    jobId: uuid('job_id')
+      .notNull()
+      .references(() => jobs.id, { onDelete: 'cascade' }),
+    sourcePortal: text('source_portal').notNull(),
+    score: smallint('score').notNull(),
+    scoreBreakdown: jsonb('score_breakdown').notNull(),
+    reasons: text('reasons').array().notNull().default(sql`'{}'::text[]`),
+    status: huntCandidateStatusEnum('status').notNull().default('discovered'),
+    resumeVariantId: uuid('resume_variant_id'),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex('hunt_candidates_run_job_idx').on(table.runId, table.jobId),
+    index('hunt_candidates_user_status_idx').on(table.userId, table.status),
+  ],
+)
+
+export const resumeVariants = pgTable(
+  'resume_variants',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    candidateId: uuid('candidate_id')
+      .notNull()
+      .references(() => huntCandidates.id, { onDelete: 'cascade' }),
+    baseResumeId: uuid('base_resume_id')
+      .notNull()
+      .references(() => resumes.id, { onDelete: 'restrict' }),
+    fileName: text('file_name').notNull(),
+    storagePath: text('storage_path').notNull(),
+    plan: jsonb('plan').notNull(),
+    changed: boolean('changed').notNull().default(false),
+    contentHash: text('content_hash'),
+    ...timestamps,
+  },
+  (table) => [uniqueIndex('resume_variants_candidate_idx').on(table.candidateId)],
+)
+
+export const portalAccounts = pgTable(
+  'portal_accounts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    portalId: text('portal_id').notNull(),
+    email: text('email').notNull(),
+    encryptedCredentials: text('encrypted_credentials'),
+    status: portalAccountStatusEnum('status').notNull().default('absent'),
+    externalUserId: text('external_user_id'),
+    actionRequired: text('action_required'),
+    lastVerifiedAt: timestamp('last_verified_at', { withTimezone: true }),
+    profileSyncedAt: timestamp('profile_synced_at', { withTimezone: true }),
+    ...timestamps,
+  },
+  (table) => [uniqueIndex('portal_accounts_user_portal_idx').on(table.userId, table.portalId)],
+)
+
+export const applyAttempts = pgTable(
+  'apply_attempts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    candidateId: uuid('candidate_id')
+      .notNull()
+      .references(() => huntCandidates.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    portalId: text('portal_id').notNull(),
+    status: applyAttemptStatusEnum('status').notNull().default('pending'),
+    externalApplicationId: text('external_application_id'),
+    submittedFields: jsonb('submitted_fields'),
+    unresolvedFields: jsonb('unresolved_fields'),
+    evidenceStoragePath: text('evidence_storage_path'),
+    error: text('error'),
+    startedAt: timestamp('started_at', { withTimezone: true }),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    ...timestamps,
+  },
+  (table) => [index('apply_attempts_candidate_idx').on(table.candidateId, table.createdAt)],
 )
 
 /* ------------------------------------------------------------- applications */
@@ -364,6 +598,7 @@ export const applications = pgTable(
     userId: uuid('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
+    jobId: uuid('job_id').references(() => jobs.id, { onDelete: 'set null' }),
 
     role: text('role').notNull(),
     company: text('company').notNull(),
@@ -407,6 +642,9 @@ export const applications = pgTable(
     uniqueIndex('applications_user_portal_job_idx')
       .on(table.userId, table.portalId, table.externalJobId)
       .where(sql`${table.externalJobId} is not null`),
+    uniqueIndex('applications_user_job_idx')
+      .on(table.userId, table.jobId)
+      .where(sql`${table.jobId} is not null`),
   ],
 )
 
@@ -574,6 +812,13 @@ export type Portal = typeof portals.$inferSelect
 export type UserPortal = typeof userPortals.$inferSelect
 export type HuntSpec = typeof huntSpecs.$inferSelect
 export type HuntRun = typeof huntRuns.$inferSelect
+export type Job = typeof jobs.$inferSelect
+export type JobSource = typeof jobSources.$inferSelect
+export type HuntCandidate = typeof huntCandidates.$inferSelect
+export type HuntRunJob = typeof huntRunJobs.$inferSelect
+export type ResumeVariant = typeof resumeVariants.$inferSelect
+export type PortalAccount = typeof portalAccounts.$inferSelect
+export type ApplyAttempt = typeof applyAttempts.$inferSelect
 export type Application = typeof applications.$inferSelect
 export type ApplicationEvent = typeof applicationEvents.$inferSelect
 export type Referral = typeof referrals.$inferSelect

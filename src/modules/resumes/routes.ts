@@ -21,6 +21,7 @@ import { recordActivity } from '../../services/activity.js'
 import { serializeEmployment, serializeKit } from '../../serializers/user.js'
 import { applyResumeAutofill } from '../me/service.js'
 import { getResumeParser, readParsedResume } from '../../services/resume-parser.js'
+import { buildResumeDocument, resumeDocumentSchema } from '../../hunt/resume-document.js'
 
 export const resumesRouter: Router = Router()
 resumesRouter.use(requireAuth)
@@ -29,6 +30,11 @@ const idParamSchema = z.object({ id: z.string().uuid() })
 
 const listQuerySchema = z.object({
   kind: z.enum(['base', 'variant', 'all']).default('all'),
+})
+
+const documentUpdateSchema = z.object({
+  document: resumeDocumentSchema,
+  confirm: z.boolean().default(false),
 })
 
 interface ResumeDto {
@@ -46,6 +52,8 @@ interface ResumeDto {
   parseError: string | null
   autofillAvailable: boolean
   uploadedAt: string
+  structuredVersion: number
+  structuredConfirmedAt: string | null
 }
 
 function serializeResume(row: Resume): ResumeDto {
@@ -65,6 +73,8 @@ function serializeResume(row: Resume): ResumeDto {
     autofillAvailable:
       row.isBase && (row.parseStatus !== 'failed' || readParsedResume(row.parsedProfile) !== null),
     uploadedAt: row.createdAt.toISOString(),
+    structuredVersion: row.structuredVersion,
+    structuredConfirmedAt: row.structuredConfirmedAt?.toISOString() ?? null,
   }
 }
 async function parseAndStoreResume(row: Resume, buffer: Buffer): Promise<Resume> {
@@ -88,6 +98,9 @@ async function parseAndStoreResume(row: Resume, buffer: Buffer): Promise<Resume>
         parsedSkills: parsed.skills,
         parsedTitles: parsed.titles,
         parsedYearsExperience: parsed.yearsExperience,
+        structuredDocument: buildResumeDocument(parsed),
+        structuredVersion: 1,
+        structuredConfirmedAt: null,
         updatedAt: new Date(),
       })
       .where(eq(resumes.id, row.id))
@@ -238,6 +251,55 @@ resumesRouter.post(
         employments: result.employments.map(serializeEmployment),
       },
       applied: result.applied,
+    })
+  }),
+)
+
+resumesRouter.get(
+  '/:id/document',
+  validate({ params: idParamSchema }),
+  asyncHandler(async (req, res) => {
+    const auth = currentUser(req)
+    const [row] = await db
+      .select()
+      .from(resumes)
+      .where(and(eq(resumes.id, pathParam(req, 'id')), eq(resumes.userId, auth.id)))
+      .limit(1)
+    if (!row) throw notFound('Resume not found')
+    if (!row.structuredDocument) throw conflict('This resume has no structured document yet.')
+    ok(res, {
+      document: row.structuredDocument,
+      version: row.structuredVersion,
+      confirmedAt: row.structuredConfirmedAt?.toISOString() ?? null,
+    })
+  }),
+)
+
+resumesRouter.put(
+  '/:id/document',
+  validate({ params: idParamSchema, body: documentUpdateSchema }),
+  asyncHandler(async (req, res) => {
+    const auth = currentUser(req)
+    const body = req.body as z.infer<typeof documentUpdateSchema>
+    const nextVersion = body.document.version + 1
+    const nextDocument = { ...body.document, version: nextVersion }
+    const [row] = await db
+      .update(resumes)
+      .set({
+        structuredDocument: nextDocument,
+        structuredVersion: nextVersion,
+        structuredConfirmedAt: body.confirm ? new Date() : null,
+        parsedSkills: nextDocument.skills.map((skill) => skill.name),
+        parsedTitles: nextDocument.experience.map((experience) => experience.role),
+        updatedAt: new Date(),
+      })
+      .where(and(eq(resumes.id, pathParam(req, 'id')), eq(resumes.userId, auth.id)))
+      .returning()
+    if (!row) throw notFound('Resume not found')
+    ok(res, {
+      document: row.structuredDocument,
+      version: row.structuredVersion,
+      confirmedAt: row.structuredConfirmedAt?.toISOString() ?? null,
     })
   }),
 )

@@ -110,11 +110,14 @@ function serializeApplication(row: Application, now = new Date()): ApplicationDt
  * an error, so a retrying webhook is harmless.
  */
 const ALLOWED_TRANSITIONS: Record<ApplicationStatus, ApplicationStatus[]> = {
-  queued: ['applied', 'rejected'],
-  applied: ['viewed', 'interview', 'rejected'],
-  viewed: ['interview', 'rejected'],
-  interview: ['rejected'],
+  queued: ['applied', 'rejected', 'needs_review', 'failed', 'closed'],
+  applied: ['viewed', 'interview', 'rejected', 'closed'],
+  viewed: ['interview', 'rejected', 'closed'],
+  interview: ['rejected', 'closed'],
   rejected: [],
+  needs_review: ['queued', 'applied', 'failed', 'closed'],
+  failed: ['queued', 'needs_review'],
+  closed: [],
 }
 
 const STATUS_TIMESTAMP: Record<ApplicationStatus, keyof Application | null> = {
@@ -123,6 +126,9 @@ const STATUS_TIMESTAMP: Record<ApplicationStatus, keyof Application | null> = {
   viewed: 'viewedAt',
   interview: 'interviewAt',
   rejected: 'rejectedAt',
+  needs_review: null,
+  failed: null,
+  closed: null,
 }
 
 applicationsRouter.get(

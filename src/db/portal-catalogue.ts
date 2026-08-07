@@ -1,3 +1,4 @@
+import { notInArray } from 'drizzle-orm'
 import { getDb } from './client.js'
 import { portals } from './schema.js'
 
@@ -11,14 +12,16 @@ import { portals } from './schema.js'
  * migrator as a side effect.
  */
 export const PORTAL_CATALOGUE = [
-  { id: 'linkedin', name: 'LinkedIn', emoji: '💼', websiteUrl: 'https://www.linkedin.com/jobs', sortOrder: 10 },
-  { id: 'wellfound', name: 'Wellfound', emoji: '🚀', websiteUrl: 'https://wellfound.com/jobs', sortOrder: 20 },
-  { id: 'remoteok', name: 'RemoteOK', emoji: '🌍', websiteUrl: 'https://remoteok.com', sortOrder: 30 },
-  { id: 'weworkremotely', name: 'We Work Remotely', emoji: '🏝️', websiteUrl: 'https://weworkremotely.com', sortOrder: 40 },
-  { id: 'ycombinator', name: 'YC Work at a Startup', emoji: '🧡', websiteUrl: 'https://www.workatastartup.com', sortOrder: 50 },
-  { id: 'naukri', name: 'Naukri', emoji: '🇮🇳', websiteUrl: 'https://www.naukri.com', sortOrder: 60 },
-  { id: 'instahyre', name: 'Instahyre', emoji: '⚡', websiteUrl: 'https://www.instahyre.com', sortOrder: 70 },
-  { id: 'indeed', name: 'Indeed', emoji: '🔎', websiteUrl: 'https://www.indeed.com', sortOrder: 80 },
+  { id: 'greenhouse', name: 'Greenhouse employers', emoji: '🏢', websiteUrl: 'https://www.greenhouse.com', sortOrder: 10 },
+  { id: 'ashby', name: 'Ashby employers', emoji: '🧩', websiteUrl: 'https://www.ashbyhq.com', sortOrder: 20 },
+  { id: 'lever', name: 'Lever employers', emoji: '🛠️', websiteUrl: 'https://www.lever.co', sortOrder: 30 },
+  { id: 'remoteok', name: 'RemoteOK', emoji: '🌍', websiteUrl: 'https://remoteok.com', sortOrder: 40 },
+  { id: 'weworkremotely', name: 'We Work Remotely', emoji: '🏝️', websiteUrl: 'https://weworkremotely.com', sortOrder: 50 },
+  { id: 'remotive', name: 'Remotive', emoji: '🛰️', websiteUrl: 'https://remotive.com', sortOrder: 60 },
+  { id: 'jobicy', name: 'Jobicy', emoji: '🧭', websiteUrl: 'https://jobicy.com', sortOrder: 70 },
+  { id: 'arbeitnow', name: 'Arbeitnow', emoji: '🌐', websiteUrl: 'https://www.arbeitnow.com', sortOrder: 80 },
+  { id: 'instahyre', name: 'Instahyre', emoji: '⚡', websiteUrl: 'https://www.instahyre.com', sortOrder: 90 },
+  { id: 'wellfound', name: 'Wellfound account', emoji: '🚀', websiteUrl: 'https://wellfound.com/jobs', sortOrder: 100 },
 ] as const
 
 export async function syncPortalCatalogue(): Promise<number> {
@@ -34,9 +37,14 @@ export async function syncPortalCatalogue(): Promise<number> {
           emoji: portal.emoji,
           websiteUrl: portal.websiteUrl,
           sortOrder: portal.sortOrder,
+          isAvailable: true,
           updatedAt: new Date(),
         },
       })
   }
+  await db
+    .update(portals)
+    .set({ isAvailable: false, updatedAt: new Date() })
+    .where(notInArray(portals.id, PORTAL_CATALOGUE.map((portal) => portal.id)))
   return PORTAL_CATALOGUE.length
 }

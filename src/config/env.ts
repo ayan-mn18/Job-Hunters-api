@@ -32,6 +32,8 @@ const schema = z.object({
   DATABASE_URL: z.string().min(1).optional(),
   DATABASE_SSL: booleanish.default('true'),
   DATABASE_POOL_MAX: z.coerce.number().int().positive().max(100).default(10),
+  REDIS_URL: z.string().url().optional(),
+
 
   JWT_ACCESS_SECRET: z.string().min(32, 'JWT_ACCESS_SECRET must be at least 32 characters'),
   JWT_REFRESH_SECRET: z.string().min(32, 'JWT_REFRESH_SECRET must be at least 32 characters'),
@@ -45,8 +47,13 @@ const schema = z.object({
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1).optional(),
   SUPABASE_STORAGE_BUCKET: z.string().default('resumes'),
   SUPABASE_SIGNED_URL_TTL: z.coerce.number().int().positive().default(3600),
+  PORTAL_CREDENTIALS_KEY: z.string().min(43).optional(),
+  CHROMIUM_EXECUTABLE_PATH: z.string().min(1).optional(),
+  PORTAL_AUTOMATION_ENABLED: booleanish.default('false'),
+
 
   MAX_RESUME_BYTES: z.coerce.number().int().positive().default(5 * 1024 * 1024),
+  MAX_PHOTO_BYTES: z.coerce.number().int().positive().default(5 * 1024 * 1024),
 
   AUTH_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
@@ -99,5 +106,7 @@ export const hasSupabaseStorage = Boolean(env.SUPABASE_URL && env.SUPABASE_SERVI
 
 /** Every route that touches Postgres 503s until this is set. */
 export const hasDatabase = Boolean(env.DATABASE_URL)
+export const hasRedis = Boolean(env.REDIS_URL)
+export const hasPortalCredentialVault = Boolean(env.PORTAL_CREDENTIALS_KEY)
 
 export type Env = typeof env

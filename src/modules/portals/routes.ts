@@ -51,6 +51,7 @@ async function listPortals(userId: string): Promise<PortalDto[]> {
       userPortals,
       and(eq(userPortals.portalId, portals.id), eq(userPortals.userId, userId)),
     )
+    .where(eq(portals.isAvailable, true))
     .orderBy(asc(portals.sortOrder), asc(portals.name))
 
   return rows.map((row) => ({
@@ -98,6 +99,7 @@ portalsRouter.put(
 
     const [portal] = await db.select().from(portals).where(eq(portals.id, portalId)).limit(1)
     if (!portal) throw notFound(`No portal called "${portalId}".`)
+    if (!portal.isAvailable) throw notFound(`Portal "${portalId}" is not supported.`)
 
     const now = new Date()
     await db

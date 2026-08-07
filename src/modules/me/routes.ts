@@ -1,10 +1,12 @@
 import { eq } from 'drizzle-orm'
 import { Router } from 'express'
 import { db } from '../../db/client.js'
-import { users } from '../../db/schema.js'
-import { notFound } from '../../lib/errors.js'
+import { kits, users, type Kit } from '../../db/schema.js'
+import { badRequest, notFound } from '../../lib/errors.js'
 import { asyncHandler, created, noContent, ok, pathParam } from '../../lib/http.js'
+import { buildObjectKey, createSignedUrl, removeObject, uploadObject } from '../../lib/storage.js'
 import { currentUser, requireAuth } from '../../middleware/auth.js'
+import { photoUpload } from '../../middleware/upload.js'
 import { validate } from '../../middleware/validate.js'
 import {
   serializeEmployment,
@@ -34,6 +36,22 @@ import {
 export const meRouter: Router = Router()
 
 meRouter.use(requireAuth)
+
+async function serializeKitResponse(kit: Kit | undefined) {
+  const data = serializeKit(kit)
+  if (!kit?.photoStoragePath) return data
+  return { ...data, photoUrl: await createSignedUrl(kit.photoStoragePath) }
+}
+
+function validPhotoSignature(file: Express.Multer.File): boolean {
+  const bytes = file.buffer
+  if (file.mimetype === 'image/jpeg') return bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))
+  if (file.mimetype === 'image/png') return bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))
+  if (file.mimetype === 'image/webp') {
+    return bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP'
+  }
+  return false
+}
 
 /**
  * `GET /me` is what the UI's AuthProvider calls on boot to restore a session,
@@ -69,7 +87,7 @@ meRouter.get(
     const auth = currentUser(req)
     const [kit, history] = await Promise.all([getKit(auth.id), getEmployments(auth.id)])
     ok(res, {
-      ...serializeKit(kit),
+      ...(await serializeKitResponse(kit)),
       employments: history.map(serializeEmployment),
     })
   }),
@@ -87,7 +105,66 @@ meRouter.put(
     const auth = currentUser(req)
     const kit = await updateKit(auth.id, req.body)
     const history = await getEmployments(auth.id)
-    ok(res, { ...serializeKit(kit), employments: history.map(serializeEmployment) })
+    ok(res, { ...(await serializeKitResponse(kit)), employments: history.map(serializeEmployment) })
+  }),
+)
+
+meRouter.post(
+  '/kit/photo',
+  photoUpload.single('photo'),
+  asyncHandler(async (req, res) => {
+    const auth = currentUser(req)
+    const file = req.file
+    if (!file) throw badRequest('Attach the profile photo as a `photo` field.')
+    if (!validPhotoSignature(file)) throw badRequest('Profile photo bytes do not match its file type.')
+
+    const [existing] = await db.select().from(kits).where(eq(kits.userId, auth.id)).limit(1)
+    if (!existing) throw notFound('Kit not found')
+
+    const key = buildObjectKey(auth.id, 'profile-photo', file.originalname)
+    await uploadObject({ key, body: file.buffer, mimeType: file.mimetype })
+
+    let updated: Kit | undefined
+    try {
+      ;[updated] = await db
+        .update(kits)
+        .set({
+          photoStoragePath: key,
+          photoFileName: file.originalname,
+          photoMimeType: file.mimetype,
+          updatedAt: new Date(),
+        })
+        .where(eq(kits.userId, auth.id))
+        .returning()
+    } catch (error) {
+      await removeObject(key)
+      throw error
+    }
+
+    if (!updated) throw notFound('Kit not found')
+    if (existing.photoStoragePath) await removeObject(existing.photoStoragePath)
+    const history = await getEmployments(auth.id)
+    ok(res, { ...(await serializeKitResponse(updated)), employments: history.map(serializeEmployment) })
+  }),
+)
+
+meRouter.delete(
+  '/kit/photo',
+  asyncHandler(async (req, res) => {
+    const auth = currentUser(req)
+    const [existing] = await db.select().from(kits).where(eq(kits.userId, auth.id)).limit(1)
+    if (!existing) throw notFound('Kit not found')
+    await db
+      .update(kits)
+      .set({
+        photoStoragePath: null,
+        photoFileName: null,
+        photoMimeType: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(kits.userId, auth.id))
+    if (existing.photoStoragePath) await removeObject(existing.photoStoragePath)
+    noContent(res)
   }),
 )
 

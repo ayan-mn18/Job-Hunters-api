@@ -1,6 +1,6 @@
 import type { Server } from 'node:http'
 import { createApp } from './app.js'
-import { env, hasDatabase, hasSupabaseStorage } from './config/env.js'
+import { env, hasDatabase, hasRedis, hasSupabaseStorage } from './config/env.js'
 import { closeDatabase, pingDatabase } from './db/client.js'
 import { logger } from './lib/logger.js'
 
@@ -22,7 +22,13 @@ const server: Server = app.listen(env.PORT, () => {
   if (!hasSupabaseStorage) {
     logger.warn('Supabase Storage is not configured — resume upload and download are disabled.')
   }
-  logger.warn('Stubbed: referral draft generation and the hunt worker. See /readyz.')
+  if (!hasRedis) {
+    logger.warn('REDIS_URL is not set — approved batches cannot enter the application queue.')
+  }
+  if (!env.PORTAL_AUTOMATION_ENABLED) {
+    logger.warn('Portal automation is disabled — discovery and approval still work safely.')
+  }
+  logger.warn('Stubbed: referral draft generation only. See /readyz.')
 
   if (hasDatabase) {
     void pingDatabase().then((result) => {

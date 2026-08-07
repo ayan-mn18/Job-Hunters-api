@@ -117,6 +117,8 @@ export interface FullKitDto {
   workAuthorization: string | null
   willingToRelocate: string | null
   skills: string[]
+  photoFileName: string | null
+  photoUrl: string | null
   /** 0–100, drives the "92% complete" chip. */
   completeness: number
   updatedAt: string | null
@@ -196,6 +198,8 @@ export function serializeKit(kit: Kit | undefined): FullKitDto {
     workAuthorization: kit?.workAuthorization ?? null,
     willingToRelocate: kit?.willingToRelocate ?? null,
     skills: kit?.skills ?? [],
+    photoFileName: kit?.photoFileName ?? null,
+    photoUrl: null,
     completeness: kitCompleteness(kit),
     updatedAt: kit?.updatedAt?.toISOString() ?? null,
   }
