@@ -687,7 +687,10 @@ export async function syncLinkedInReferrals(
     let imported = 0
     let duplicates = 0
     for (const threadUrl of threadDiscovery.urls) {
-      await page.goto(threadUrl, { waitUntil: 'commit', timeout: 15_000 }).catch(() => undefined)
+      await page
+        .goto(threadUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 })
+        .catch(() => undefined)
+      await page.waitForTimeout(500)
       const messages = await extractThreadMessages(page)
       scannedMessages += messages.length
       const dated = messages.filter((message) => parseLinkedInMessageDate(message.timestamp) !== null)
