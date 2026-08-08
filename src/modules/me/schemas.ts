@@ -43,6 +43,7 @@ export const updateKitSchema = z.object({
 
   noticePeriod: optionalText(80),
   totalExperience: optionalText(80),
+  maxYearsExperience: z.coerce.number().int().min(0).max(50).optional(),
   currentCtc: optionalText(80),
   expectedCtc: optionalText(80),
   workAuthorization: optionalText(200),
@@ -86,6 +87,7 @@ export const completeOnboardingSchema = z.object({
   phone: z.string().max(40).optional(),
   city: z.string().max(100).optional(),
   noticePeriod: z.string().max(80).optional(),
+  maxYearsExperience: z.coerce.number().int().min(0).max(50).optional(),
   /** Informational: the resume is uploaded by its own endpoint, not here. */
   resumeName: z.string().max(200).optional(),
 })

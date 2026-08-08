@@ -5,6 +5,7 @@ import { db } from '../../db/client.js'
 import { huntRunJobs, huntRuns, huntSpecs, type HuntRun, type HuntSpec } from '../../db/schema.js'
 import { approveDailyBatch } from '../../hunt/approval.js'
 import { discoverForRun, listCandidates } from '../../hunt/discovery/service.js'
+import { rescoreHuntRun } from '../../hunt/rescore.js'
 import { conflict, notFound } from '../../lib/errors.js'
 import { asyncHandler, created, ok, pathParam } from '../../lib/http.js'
 import { currentUser, requireAuth } from '../../middleware/auth.js'
@@ -200,6 +201,15 @@ huntRouter.get(
   asyncHandler(async (req, res) => {
     const auth = currentUser(req)
     ok(res, await listCandidates(auth.id, pathParam(req, 'id')))
+  }),
+)
+
+huntRouter.post(
+  '/runs/:id/rescore',
+  validate({ params: runParamSchema }),
+  asyncHandler(async (req, res) => {
+    const auth = currentUser(req)
+    ok(res, await rescoreHuntRun(auth.id, pathParam(req, 'id')))
   }),
 )
 

@@ -1,0 +1,2 @@
+ALTER TYPE "public"."hunt_run_job_status" ADD VALUE 'experience_mismatch' BEFORE 'insufficient_skills';--> statement-breakpoint
+ALTER TABLE "kits" ADD COLUMN "max_years_experience" smallint DEFAULT 5 NOT NULL;

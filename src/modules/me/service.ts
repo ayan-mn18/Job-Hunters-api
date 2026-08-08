@@ -274,6 +274,7 @@ export async function completeOnboarding(userId: string, input: CompleteOnboardi
   const phone = input.phone?.trim() || null
   const city = input.city?.trim() || null
   const noticePeriod = input.noticePeriod?.trim() || null
+  const maxYearsExperience = input.maxYearsExperience
 
   const knownPortals = requestedPortals.length
     ? await db
@@ -286,7 +287,13 @@ export async function completeOnboarding(userId: string, input: CompleteOnboardi
   const user = await db.transaction(async (tx) => {
     await tx
       .insert(kits)
-      .values({ userId, phone, city, noticePeriod })
+      .values({
+        userId,
+        phone,
+        city,
+        noticePeriod,
+        ...(maxYearsExperience !== undefined ? { maxYearsExperience } : {}),
+      })
       .onConflictDoUpdate({
         target: kits.userId,
         set: {
@@ -297,6 +304,7 @@ export async function completeOnboarding(userId: string, input: CompleteOnboardi
           phone: sql`coalesce(${phone}::text, ${kits.phone})`,
           city: sql`coalesce(${city}::text, ${kits.city})`,
           noticePeriod: sql`coalesce(${noticePeriod}::text, ${kits.noticePeriod})`,
+          ...(maxYearsExperience !== undefined ? { maxYearsExperience } : {}),
           updatedAt: new Date(),
         },
       })

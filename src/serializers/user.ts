@@ -21,6 +21,7 @@ export interface KitDraftDto {
   phone: string
   city: string
   noticePeriod: string
+  maxYearsExperience: number
   resumeName: string
 }
 
@@ -70,6 +71,7 @@ export async function buildKitDraft(userId: string): Promise<Partial<KitDraftDto
     draft.phone = kitRow.phone ?? ''
     draft.city = kitRow.city ?? ''
     draft.noticePeriod = kitRow.noticePeriod ?? ''
+    draft.maxYearsExperience = kitRow.maxYearsExperience
   }
   draft.resumeName = baseResume?.fileName ?? ''
 
@@ -112,6 +114,7 @@ export interface FullKitDto {
   headline: string | null
   noticePeriod: string | null
   totalExperience: string | null
+  maxYearsExperience: number
   currentCtc: string | null
   expectedCtc: string | null
   workAuthorization: string | null
@@ -193,6 +196,7 @@ export function serializeKit(kit: Kit | undefined): FullKitDto {
     headline: kit?.headline ?? null,
     noticePeriod: kit?.noticePeriod ?? null,
     totalExperience: kit?.totalExperience ?? null,
+    maxYearsExperience: kit?.maxYearsExperience ?? 5,
     currentCtc: kit?.currentCtc ?? null,
     expectedCtc: kit?.expectedCtc ?? null,
     workAuthorization: kit?.workAuthorization ?? null,

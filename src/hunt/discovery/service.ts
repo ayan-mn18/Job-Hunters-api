@@ -228,13 +228,10 @@ export async function discoverForRun(userId: string, runId: string): Promise<{
       dealBreakers: spec.dealBreakers,
       skills: profileSkills,
       minMatchScore: spec.minMatchScore,
+      maxYearsExperience: kit?.maxYearsExperience ?? 5,
     })
     scored += 1
-    const status = ranking.accepted
-      ? 'eligible'
-      : ranking.reasons.some((reason) => reason.startsWith('Deal breaker matched:'))
-        ? 'deal_breaker'
-        : 'below_threshold'
+    const status = ranking.decision
     runJobValues.push({
       runId,
       userId,

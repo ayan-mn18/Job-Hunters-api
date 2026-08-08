@@ -22,6 +22,20 @@
       "when": 1786139254109,
       "tag": "0002_green_gladiator",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1786183986272,
+      "tag": "0003_fine_penance",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1786185133928,
+      "tag": "0004_spotty_wasp",
+      "breakpoints": true
     }
   ]
 }
