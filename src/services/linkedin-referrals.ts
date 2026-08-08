@@ -232,7 +232,7 @@ async function connectLinkedInInBrowser(input: {
     await rm(userDataDir, { recursive: true, force: true })
   }
 
-  await syncLinkedInReferrals(input.userId, 7).catch((error) => {
+  await syncLinkedInReferrals(input.userId, 90).catch((error) => {
     logger.error({ err: error, userId: input.userId }, 'initial LinkedIn referral sync failed')
   })
 }
@@ -246,23 +246,26 @@ export async function disconnectLinkedInReferrals(userId: string): Promise<void>
 export function isReferralRequest(body: string): boolean {
   return (
     /\breferral\b/i.test(body) ||
-    /\b(?:can|could|would|will)\s+(?:you|u)\s+(?:please\s+)?refer\b|\bplease\s+refer\s+me\b|\brefer\s+me\b/i.test(body) ||
+    /\b(?:can|could|would|will)\s+(?:you|u)\s+(?:please\s+)?refer\b|\bplease\s+refer\s+(?:me|my\s+profile)\b|\brefer\s+(?:me|my\s+profile)\b/i.test(body) ||
     /\b(?:need|want|seeking|requesting|looking\s+for|appreciate|help(?:\s+me)?\s+(?:with|get))\b.{0,100}\b(?:a\s+)?referral\b/i.test(body) ||
     /\b(?:recommend|refer)\s+(?:me|my\s+profile)\b.{0,100}\b(?:job|role|position|opening)\b/i.test(body)
   )
 }
 
 function extractJobId(body: string): string | null {
-  return (
+  const value =
     body.match(
-      /\b(?:job\s*(?:id|#)|req(?:uisition)?\s*(?:id|#)?|requisition)\s*[:#-]?\s*([A-Z0-9][A-Z0-9_-]{2,})\b/i,
-    )?.[1] ?? null
-  )
+      /\b(?:job\s*(?:id|#)|req(?:uisition)?\s*(?:id|#)|requisition\s*(?:id|#))\s*[:#-]?\s*([A-Z0-9][A-Z0-9_-]{2,})\b/i,
+    )?.[1] ??
+    body.match(/\b(REF\d{5,}[A-Z0-9_-]*)\b/i)?.[1] ??
+    body.match(/linkedin\.com\/jobs\/view\/(\d{6,})/i)?.[1]
+  return value?.replace(/^j(?=REF\d)/i, '') ?? null
 }
 
 function extractTargetRole(body: string): string | null {
   const value =
     body.match(/\b(?:for|to)\s+(?:the\s+)?([A-Z][A-Za-z0-9+.#/&() -]{2,80}?)\s+(?:role|position|opening|job)\b/)?.[1] ??
+    body.match(/\b(?:opportunity|opening)\s+(?:of|for)\s+([A-Z][A-Za-z0-9+.#/&() -]{2,80}?)\s+role\b/i)?.[1] ??
     body.match(/\b(?:role|position|opening)\s+(?:of|for|:)?\s*([A-Z][A-Za-z0-9+.#/&() -]{2,80})(?:[,.]|$)/)?.[1]
   return value?.trim() ?? null
 }
@@ -463,7 +466,7 @@ async function extractThreadMessages(page: Page): Promise<RawLinkedInMessage[]> 
   for (let pass = 0; pass < 8 && unchangedPasses < 2; pass += 1) {
     const before = await page.locator(messageSelector).count()
     await messageList
-      .evaluate((element) => element.scrollTo(0, 0))
+      .evaluate((element) => element.scrollTo(0, -element.scrollHeight))
       .catch(() => undefined)
     await sleep(600)
     const after = await page.locator(messageSelector).count()
@@ -511,7 +514,7 @@ async function extractThreadMessages(page: Page): Promise<RawLinkedInMessage[]> 
           download: link.getAttribute('download'),
         }))
         const eventClasses = typeof element.className === 'string' ? element.className : ''
-        const outbound = /--self|outbound|from-me/i.test(eventClasses)
+        const outbound = !/msg-s-event-listitem--other/.test(eventClasses)
         return [
           {
             id:
@@ -759,7 +762,7 @@ async function runScheduledSyncs(): Promise<void> {
     )
   for (const account of accounts) {
     if (syncingUsers.has(account.userId)) continue
-    await syncLinkedInReferrals(account.userId, account.profileSyncedAt ? 1 : 7).catch((error) => {
+    await syncLinkedInReferrals(account.userId, account.profileSyncedAt ? 1 : 90).catch((error) => {
       logger.error({ err: error, userId: account.userId }, 'scheduled LinkedIn referral sync failed')
     })
   }

@@ -35,6 +35,69 @@ describe('LinkedIn referral extraction', () => {
     assert.equal(isReferralRequest('Thanks for connecting. How are you?'), false)
   })
 
+  it('recognises long Visa referral templates', () => {
+    assert.equal(
+      isReferralRequest(
+        "If you feel my profile is a good fit, I'd be grateful if you could refer me for the role. I've attached my resume.",
+      ),
+      true,
+    )
+    assert.equal(
+      isReferralRequest(
+        'Please review my resume and if you feel I am a good fit then please refer my profile for above-mentioned role.',
+      ),
+      true,
+    )
+  })
+
+  it('extracts Workday and LinkedIn job identifiers', () => {
+    const workday = extractReferrals(
+      [
+        message({
+          body: 'Referral Request for Software Engineer – REF082722W',
+        }),
+      ],
+      new Date('2026-08-01T00:00:00.000Z'),
+    )
+    const linkedIn = extractReferrals(
+      [
+        message({
+          id: 'linkedin-job',
+          body: "I'd be grateful if you could refer me for the Software Engineer role. Job link: https://www.linkedin.com/jobs/view/4433092549/",
+        }),
+      ],
+      new Date('2026-08-01T00:00:00.000Z'),
+    )
+
+    assert.equal(workday[0]?.jobRequisitionId, 'REF082722W')
+    assert.equal(linkedIn[0]?.jobRequisitionId, '4433092549')
+    const mistypedPrefix = extractReferrals(
+      [
+        message({
+          id: 'mistyped-job-id',
+          body: 'Could you please refer me? jobId: jREF082672W',
+        }),
+      ],
+      new Date('2026-08-01T00:00:00.000Z'),
+    )
+
+    assert.equal(mistypedPrefix[0]?.jobRequisitionId, 'REF082672W')
+    assert.equal(linkedIn[0]?.targetRole, 'Software Engineer')
+  })
+
+  it('extracts opportunity-style role names', () => {
+    const referrals = extractReferrals(
+      [
+        message({
+          body: 'Recently I found that there is opportunity of Software Engineer 1 role at Visa. Please refer my profile.',
+        }),
+      ],
+      new Date('2026-08-01T00:00:00.000Z'),
+    )
+
+    assert.equal(referrals[0]?.targetRole, 'Software Engineer 1')
+  })
+
   it('parses LinkedIn date headings and group times', () => {
     const parsed = parseLinkedInMessageDate('Aug 6||10:47 AM', NOW)
     const weekday = parseLinkedInMessageDate('Wednesday||4:15 PM', NOW)

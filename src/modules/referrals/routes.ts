@@ -28,7 +28,7 @@ const linkedinConnectSchema = z.object({
   profileUrl: z.string().trim().min(1).max(600),
 })
 const linkedinSyncSchema = z.object({
-  days: z.coerce.number().int().min(1).max(7).default(7),
+  days: z.coerce.number().int().min(1).max(90).default(90),
 })
 
 function normalizeLinkedInProfileUrl(value: string): string {
