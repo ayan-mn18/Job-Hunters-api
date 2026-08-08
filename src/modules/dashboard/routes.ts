@@ -480,7 +480,7 @@ dashboardRouter.get(
           .select({
             job: jobs,
             sourcePortal: sql<string>`min(${jobSources.portalId})`,
-            discoveredAt: sql<Date>`min(${jobSources.fetchedAt})`,
+            discoveredAt: sql<string>`min(${jobSources.fetchedAt})`,
           })
           .from(jobSources)
           .innerJoin(jobs, eq(jobSources.jobId, jobs.id))
@@ -509,7 +509,7 @@ dashboardRouter.get(
         salary: salaryFromText(job.descriptionText),
         jobUrl: job.canonicalUrl,
         postedAt: job.postedAt.toISOString(),
-        discoveredAt: discoveredAt.toISOString(),
+        discoveredAt: new Date(discoveredAt).toISOString(),
       }))
     }
 
