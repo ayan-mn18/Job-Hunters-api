@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 import {
   extractReferrals,
   isReferralRequest,
+  parseLinkedInMessageDate,
   type RawLinkedInMessage,
 } from './linkedin-referrals.js'
 
@@ -32,6 +33,20 @@ describe('LinkedIn referral extraction', () => {
     assert.equal(isReferralRequest('Could you please refer me for this opening?'), true)
     assert.equal(isReferralRequest('I am seeking a referral at Acme.'), true)
     assert.equal(isReferralRequest('Thanks for connecting. How are you?'), false)
+  })
+
+  it('parses LinkedIn date headings and group times', () => {
+    const parsed = parseLinkedInMessageDate('Aug 6||10:47 AM', NOW)
+    const weekday = parseLinkedInMessageDate('Wednesday||4:15 PM', NOW)
+
+    assert.equal(parsed?.getFullYear(), 2026)
+    assert.equal(parsed?.getMonth(), 7)
+    assert.equal(parsed?.getDate(), 6)
+    assert.equal(parsed?.getHours(), 10)
+    assert.equal(parsed?.getMinutes(), 47)
+    assert.equal(weekday?.getDay(), 3)
+    assert.equal(weekday?.getHours(), 16)
+    assert.equal(weekday?.getMinutes(), 15)
   })
 
   it('extracts the message, job id, profile and resume link', () => {
