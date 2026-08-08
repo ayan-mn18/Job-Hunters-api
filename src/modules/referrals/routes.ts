@@ -3,8 +3,8 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { db } from '../../db/client.js'
 import { referrals, referralSourceEnum, type Referral } from '../../db/schema.js'
-import { notFound } from '../../lib/errors.js'
-import { asyncHandler, created, ok, pathParam } from '../../lib/http.js'
+import { badRequest, notFound } from '../../lib/errors.js'
+import { asyncHandler, created, noContent, ok, pathParam } from '../../lib/http.js'
 import { createSignedUrl, storageConfigured } from '../../lib/storage.js'
 import { localDate, localDateKey } from '../../lib/sql.js'
 import { toDayLabel, toLocalDateKey, toLocalTimeLabel, toRelativeLabel } from '../../lib/time.js'
@@ -13,11 +13,36 @@ import { generationLimiter } from '../../middleware/rateLimit.js'
 import { validate, validatedQuery } from '../../middleware/validate.js'
 import { recordActivity } from '../../services/activity.js'
 import { getReferralDraftGenerator } from '../../services/referral-draft.js'
+import {
+  beginLinkedInReferralConnection,
+  disconnectLinkedInReferrals,
+  getLinkedInReferralStatus,
+  syncLinkedInReferrals,
+} from '../../services/linkedin-referrals.js'
 
 export const referralsRouter: Router = Router()
 referralsRouter.use(requireAuth)
 
 const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD')
+const linkedinConnectSchema = z.object({
+  profileUrl: z.string().trim().min(1).max(600),
+})
+const linkedinSyncSchema = z.object({
+  days: z.coerce.number().int().min(1).max(7).default(7),
+})
+
+function normalizeLinkedInProfileUrl(value: string): string {
+  try {
+    const withProtocol = /^https?:\/\//i.test(value) ? value : `https://${value}`
+    const url = new URL(withProtocol)
+    if (!/(^|\.)linkedin\.com$/i.test(url.hostname) || !url.pathname.startsWith('/in/')) {
+      throw new Error('wrong host or path')
+    }
+    return url.toString()
+  } catch {
+    throw badRequest('Use your LinkedIn profile URL, for example linkedin.com/in/your-name.')
+  }
+}
 
 const daysQuerySchema = z.object({
   /** How many days back the picker shows. */
@@ -112,6 +137,47 @@ function serializeReferral(row: Referral): ReferralDto {
     draftStubbed: row.draftModel === 'stub',
   }
 }
+
+referralsRouter.get(
+  '/linkedin/status',
+  asyncHandler(async (req, res) => {
+    ok(res, await getLinkedInReferralStatus(currentUser(req).id))
+  }),
+)
+
+referralsRouter.post(
+  '/linkedin/connect',
+  validate({ body: linkedinConnectSchema }),
+  asyncHandler(async (req, res) => {
+    const auth = currentUser(req)
+    const profileUrl = normalizeLinkedInProfileUrl(String(req.body.profileUrl))
+    ok(
+      res,
+      await beginLinkedInReferralConnection({
+        userId: auth.id,
+        email: auth.email,
+        profileUrl,
+      }),
+    )
+  }),
+)
+
+referralsRouter.post(
+  '/linkedin/sync',
+  validate({ body: linkedinSyncSchema }),
+  asyncHandler(async (req, res) => {
+    const result = await syncLinkedInReferrals(currentUser(req).id, Number(req.body.days))
+    ok(res, result)
+  }),
+)
+
+referralsRouter.delete(
+  '/linkedin/connection',
+  asyncHandler(async (req, res) => {
+    await disconnectLinkedInReferrals(currentUser(req).id)
+    noContent(res)
+  }),
+)
 
 /**
  * Day buckets for the picker: `{ date, label, linkedin, email }`.

@@ -3,8 +3,10 @@ import { createApp } from './app.js'
 import { env, hasDatabase, hasRedis, hasSupabaseStorage } from './config/env.js'
 import { closeDatabase, pingDatabase } from './db/client.js'
 import { logger } from './lib/logger.js'
+import { startLinkedInReferralScheduler } from './services/linkedin-referrals.js'
 
 const app = createApp()
+const stopLinkedInReferralScheduler = startLinkedInReferralScheduler()
 
 const server: Server = app.listen(env.PORT, () => {
   logger.info(
@@ -48,6 +50,7 @@ let shuttingDown = false
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  stopLinkedInReferralScheduler()
   logger.info({ signal }, 'shutting down')
 
   const force = setTimeout(() => {
