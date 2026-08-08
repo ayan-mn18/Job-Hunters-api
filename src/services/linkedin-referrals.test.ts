@@ -112,6 +112,28 @@ describe('LinkedIn referral extraction', () => {
     assert.equal(weekday?.getMinutes(), 15)
   })
 
+  it('returns one earliest eligible request per conversation', () => {
+    const referrals = extractReferrals(
+      [
+        message({
+          id: 'later-request',
+          timestamp: '2026-08-07T12:00:00.000Z',
+          body: 'Could you please refer me for the Backend Engineer role?',
+        }),
+        message({
+          id: 'earlier-request',
+          timestamp: '2026-08-06T12:00:00.000Z',
+          body: 'I would be grateful if you could refer me for the Software Engineer role.',
+        }),
+      ],
+      new Date('2026-08-01T00:00:00.000Z'),
+    )
+
+    assert.equal(referrals.length, 1)
+    assert.equal(referrals[0]?.externalMessageId, 'earlier-request')
+    assert.equal(referrals[0]?.targetRole, 'Software Engineer')
+  })
+
   it('extracts the message, job id, profile and resume link', () => {
     const referrals = extractReferrals([message()], new Date('2026-08-01T00:00:00.000Z'))
 

@@ -1,8 +1,14 @@
-import { and, count, desc, eq, ilike, or, sql, type SQL } from 'drizzle-orm'
+import { and, count, desc, eq, gte, ilike, lte, or, sql, type SQL } from 'drizzle-orm'
 import { Router } from 'express'
 import { z } from 'zod'
 import { db } from '../../db/client.js'
-import { referrals, referralSourceEnum, type Referral } from '../../db/schema.js'
+import {
+  linkedinConversations,
+  linkedinMessages,
+  referrals,
+  referralSourceEnum,
+  type Referral,
+} from '../../db/schema.js'
 import { badRequest, notFound } from '../../lib/errors.js'
 import { asyncHandler, created, noContent, ok, pathParam } from '../../lib/http.js'
 import { createSignedUrl, storageConfigured } from '../../lib/storage.js'
@@ -28,7 +34,7 @@ const linkedinConnectSchema = z.object({
   profileUrl: z.string().trim().min(1).max(600),
 })
 const linkedinSyncSchema = z.object({
-  days: z.coerce.number().int().min(1).max(90).default(90),
+  days: z.coerce.number().int().min(1).max(90).default(7),
 })
 
 function normalizeLinkedInProfileUrl(value: string): string {
@@ -51,10 +57,20 @@ const daysQuerySchema = z.object({
 
 const listQuerySchema = z.object({
   date: dateSchema.optional(),
+  days: z.coerce.number().int().min(1).max(90).optional(),
   handled: z.enum(['true', 'false', 'all']).default('all'),
   source: z.enum(['linkedin', 'email', 'all']).default('all'),
   q: z.string().trim().max(200).optional(),
   limit: z.coerce.number().int().min(1).max(200).default(100),
+  offset: z.coerce.number().int().min(0).default(0),
+})
+
+const linkedinMessagesQuerySchema = z.object({
+  from: dateSchema.optional(),
+  to: dateSchema.optional(),
+  direction: z.enum(['inbound', 'outbound', 'all']).default('all'),
+  q: z.string().trim().max(200).optional(),
+  limit: z.coerce.number().int().min(1).max(500).default(500),
   offset: z.coerce.number().int().min(0).default(0),
 })
 
@@ -179,6 +195,87 @@ referralsRouter.delete(
   }),
 )
 
+referralsRouter.get(
+  '/linkedin/messages',
+  validate({ query: linkedinMessagesQuerySchema }),
+  asyncHandler(async (req, res) => {
+    const auth = currentUser(req)
+    const query = validatedQuery<z.infer<typeof linkedinMessagesQuerySchema>>(req)
+    const baseFilters: SQL[] = [eq(linkedinMessages.userId, auth.id)]
+    if (query.from) baseFilters.push(sql`${localDate(linkedinMessages.sentAt)} >= ${query.from}::date`)
+    if (query.to) baseFilters.push(sql`${localDate(linkedinMessages.sentAt)} <= ${query.to}::date`)
+    if (query.q) {
+      const needle = `%${query.q}%`
+      const search = or(
+        ilike(linkedinMessages.body, needle),
+        ilike(linkedinMessages.senderName, needle),
+        ilike(linkedinConversations.title, needle),
+      )
+      if (search) baseFilters.push(search)
+    }
+    const rowFilters = [...baseFilters]
+    if (query.direction !== 'all') {
+      rowFilters.push(eq(linkedinMessages.outbound, query.direction === 'outbound'))
+    }
+    const baseWhere = and(...baseFilters)
+    const rowWhere = and(...rowFilters)
+
+    const [rows, [totalRow], [countRow], dateRows] = await Promise.all([
+      db
+        .select({ message: linkedinMessages, conversation: linkedinConversations })
+        .from(linkedinMessages)
+        .innerJoin(linkedinConversations, eq(linkedinMessages.conversationId, linkedinConversations.id))
+        .where(rowWhere)
+        .orderBy(desc(linkedinMessages.sentAt))
+        .limit(query.limit)
+        .offset(query.offset),
+      db
+        .select({ value: count() })
+        .from(linkedinMessages)
+        .innerJoin(linkedinConversations, eq(linkedinMessages.conversationId, linkedinConversations.id))
+        .where(rowWhere),
+      db
+        .select({
+          total: sql<number>`count(*)::int`,
+          inbound: sql<number>`count(*) filter (where ${linkedinMessages.outbound} = false)::int`,
+          outbound: sql<number>`count(*) filter (where ${linkedinMessages.outbound} = true)::int`,
+        })
+        .from(linkedinMessages)
+        .innerJoin(linkedinConversations, eq(linkedinMessages.conversationId, linkedinConversations.id))
+        .where(baseWhere),
+      db
+        .selectDistinct({ date: localDateKey(linkedinMessages.sentAt) })
+        .from(linkedinMessages)
+        .where(eq(linkedinMessages.userId, auth.id))
+        .orderBy(desc(localDateKey(linkedinMessages.sentAt))),
+    ])
+
+    ok(res, rows.map(({ message, conversation }) => ({
+      id: message.id,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      threadUrl: conversation.threadUrl,
+      body: message.body,
+      senderName: message.senderName,
+      senderProfileUrl: message.senderProfileUrl,
+      sentAt: message.sentAt.toISOString(),
+      date: toLocalDateKey(message.sentAt),
+      time: toLocalTimeLabel(message.sentAt),
+      relativeTime: toRelativeLabel(message.sentAt),
+      outbound: message.outbound,
+      links: message.links,
+    })), {
+      total: countRow?.total ?? 0,
+      inbound: countRow?.inbound ?? 0,
+      outbound: countRow?.outbound ?? 0,
+      filteredTotal: totalRow?.value ?? 0,
+      dates: dateRows.map((row) => row.date),
+      limit: query.limit,
+      offset: query.offset,
+    })
+  }),
+)
+
 /**
  * Day buckets for the picker: `{ date, label, linkedin, email }`.
  *
@@ -233,9 +330,9 @@ referralsRouter.get(
     const filters: SQL[] = [eq(referrals.userId, auth.id)]
 
     if (query.date) {
-      filters.push(
-        sql`${localDate(referrals.receivedAt)} = ${query.date}::date`,
-      )
+      filters.push(sql`${localDate(referrals.receivedAt)} = ${query.date}::date`)
+    } else if (query.days) {
+      filters.push(gte(referrals.receivedAt, new Date(Date.now() - query.days * 86_400_000)))
     }
     if (query.handled !== 'all') {
       filters.push(eq(referrals.handled, query.handled === 'true'))

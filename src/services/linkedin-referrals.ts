@@ -1,8 +1,9 @@
 import crypto from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { access, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { spawn } from 'node:child_process'
 import { and, eq, isNull, lt, or } from 'drizzle-orm'
 import type { BrowserContext, Page } from 'playwright-core'
 import { env, hasPortalCredentialVault } from '../config/env.js'
@@ -20,7 +21,7 @@ const PORTAL_ID = 'linkedin-referrals'
 const DAILY_SYNC_MS = 24 * 60 * 60 * 1000
 const SCHEDULER_TICK_MS = 60 * 60 * 1000
 const CONNECT_TIMEOUT_MS = 10 * 60 * 1000
-const MAX_THREADS_PER_SYNC = 80
+const MAX_THREADS_PER_SYNC = 2_000
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
 
 interface StoredBrowserState {
@@ -82,6 +83,121 @@ export interface LinkedInSyncResult {
   duplicates: number
   lookbackDays: number
   syncedAt: string
+}
+interface ReferenceLinkedInExport {
+  conversations: Array<{
+    messages: Array<{
+      id: string
+      body: string
+      senderName: string
+      senderProfileUrl: string | null
+      timestampRaw: string
+      timestamp: string | null
+      outbound: boolean
+      links: RawLinkedInMessage['links']
+    }>
+  }>
+}
+
+interface ReferenceScrapeResult {
+  conversations: RawLinkedInMessage[][]
+  discoveredConversations: number
+}
+
+async function runProcess(
+  cwd: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<string> {
+  const { promise, resolve, reject } = Promise.withResolvers<string>()
+  const child = spawn('npm', args, {
+    cwd,
+    env: process.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (chunk: Buffer) => {
+    if (stdout.length < 50_000) stdout += chunk.toString('utf8')
+  })
+  child.stderr.on('data', (chunk: Buffer) => {
+    if (stderr.length < 20_000) stderr += chunk.toString('utf8')
+  })
+  child.once('error', reject)
+  child.once('exit', (code, signal) => {
+    if (code === 0) resolve(stdout)
+    else reject(new Error(`LinkedIn DM scraper exited ${code ?? signal}: ${stderr.trim()}`))
+  })
+  const timer = setTimeout(() => {
+    child.kill('SIGTERM')
+    reject(new Error('LinkedIn DM scraper timed out.'))
+  }, timeoutMs)
+  timer.unref()
+  try {
+    return await promise
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function scrapeWithReferenceProject(
+  lookbackDays: number,
+): Promise<ReferenceScrapeResult | null> {
+  const scraperDir = path.resolve(process.cwd(), '../linked-in-dm-scraper')
+  const profileDir = path.join(scraperDir, 'data/browser-profile')
+  try {
+    await Promise.all([access(path.join(scraperDir, 'package.json')), access(profileDir)])
+  } catch {
+    return null
+  }
+
+  const outputPath = path.join(scraperDir, 'data/linkedin-dms.json')
+  try {
+    const output = await runProcess(
+      scraperDir,
+      [
+        'run',
+        'scrape',
+        '--',
+        '--hours',
+        String(lookbackDays * 24),
+        '--max-conversations',
+        '1000',
+        '--conversation-scrolls',
+        '120',
+        '--message-scrolls',
+        '80',
+        '--delay-ms',
+        '3000',
+        '--profile-dir',
+        profileDir,
+        '--output',
+        outputPath,
+      ],
+      15 * 60 * 1000,
+    )
+    const parsed = JSON.parse(await readFile(outputPath, 'utf8')) as ReferenceLinkedInExport
+    const discoveredConversations = Number(
+      output.match(/Found (\d+) conversations/)?.[1] ?? parsed.conversations.length,
+    )
+    return {
+      conversations: parsed.conversations.map((conversation) =>
+        conversation.messages.map((message) => ({
+          id: message.id,
+          body: message.body,
+          senderName: message.senderName,
+          senderProfileUrl: message.senderProfileUrl,
+          timestamp: message.timestamp ?? message.timestampRaw,
+          outbound: message.outbound,
+          links: message.links,
+        })),
+      ),
+      discoveredConversations,
+    }
+  } catch (error) {
+    logger.warn({ err: error }, 'reference LinkedIn DM scraper failed; using session fallback')
+    return null
+  }
 }
 
 const connectionJobs = new Map<string, Promise<void>>()
@@ -232,7 +348,7 @@ async function connectLinkedInInBrowser(input: {
     await rm(userDataDir, { recursive: true, force: true })
   }
 
-  await syncLinkedInReferrals(input.userId, 90).catch((error) => {
+  await syncLinkedInReferrals(input.userId, 7).catch((error) => {
     logger.error({ err: error, userId: input.userId }, 'initial LinkedIn referral sync failed')
   })
 }
@@ -287,8 +403,15 @@ function normalizeLinkedInUrl(value: string | null): string | null {
   }
 }
 
+interface ThreadReference {
+  url: string
+  title: string
+  snippet: string
+  timestampRaw: string
+}
+
 interface ThreadDiscovery {
-  urls: string[]
+  threads: ThreadReference[]
   inboxesScanned: string[]
   visibleConversations: number
 }
@@ -299,14 +422,12 @@ function parseLinkedInDateLabel(label: string, now = new Date()): Date | null {
   if (/^today$/i.test(clean)) return new Date(now)
   if (/^yesterday$/i.test(clean)) return new Date(now.getTime() - 86_400_000)
   if (/^\d{1,2}:\d{2}\s*(?:AM|PM)$/i.test(clean)) return new Date(now)
-
   const weekdays = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
   const weekday = weekdays.indexOf(clean.toLowerCase())
   if (weekday >= 0) {
     const daysBack = (now.getDay() - weekday + 7) % 7
     return new Date(now.getTime() - daysBack * 86_400_000)
   }
-
   const withYear = /\b\d{4}\b/.test(clean) ? clean : `${clean}, ${now.getFullYear()}`
   const parsed = new Date(withYear)
   if (Number.isNaN(parsed.getTime())) return null
@@ -318,7 +439,6 @@ export function parseLinkedInMessageDate(value: string, now = new Date()): Date 
   if (!value) return null
   const direct = new Date(value)
   if (!Number.isNaN(direct.getTime())) return direct
-
   const [dateLabel = '', timeLabel = ''] = value.split('||')
   const date = parseLinkedInDateLabel(dateLabel, now)
   if (!date) return null
@@ -333,85 +453,10 @@ export function parseLinkedInMessageDate(value: string, now = new Date()): Date 
   return date
 }
 
-async function collectCurrentInboxThreadUrls(page: Page, cutoff: Date): Promise<ThreadDiscovery> {
-  const list = page.locator('.msg-conversations-container__conversations-list').first()
-  await list.waitFor({ state: 'visible', timeout: 15_000 }).catch(() => undefined)
-  const urls = new Set<string>()
-  const seenCards = new Set<string>()
-  let visibleConversations = 0
-  let unchangedPasses = 0
-  let reachedCutoff = false
-  let consecutiveOldConversations = 0
-
-  for (
-    let pass = 0;
-    pass < 24 && urls.size < MAX_THREADS_PER_SYNC && unchangedPasses < 3 && !reachedCutoff;
-    pass += 1
-  ) {
-    const before = seenCards.size
-    const cards = page.locator(
-      '.msg-conversation-listitem:not(.msg-conversation-card--occluded) .msg-conversation-listitem__link',
-    )
-    const count = await cards.count()
-    for (let index = 0; index < count && urls.size < MAX_THREADS_PER_SYNC; index += 1) {
-      const card = cards.nth(index)
-      const summary = await card
-        .evaluate((element) => {
-          const row = element.closest<HTMLElement>('.msg-conversation-listitem')
-          return {
-            key: [
-              row?.id,
-              row?.querySelector<HTMLElement>('.msg-conversation-listitem__participant-names')?.innerText,
-              row?.querySelector<HTMLElement>(
-                '.msg-conversation-card__message-snippet, .msg-conversation-card__message-snippet--v2',
-              )?.innerText,
-              row?.querySelector<HTMLElement>('time')?.innerText,
-            ].join('|'),
-            timeLabel: row?.querySelector<HTMLElement>('time')?.innerText.trim() ?? '',
-          }
-        })
-        .catch(() => null)
-      if (!summary || seenCards.has(summary.key)) continue
-      seenCards.add(summary.key)
-      visibleConversations += 1
-
-      const conversationDate = parseLinkedInDateLabel(summary.timeLabel)
-      if (conversationDate && conversationDate < cutoff) {
-        consecutiveOldConversations += 1
-        if (consecutiveOldConversations >= 3) {
-          reachedCutoff = true
-          break
-        }
-        continue
-      }
-      consecutiveOldConversations = 0
-
-      await card.evaluate((element) => (element as HTMLElement).click()).catch(() => undefined)
-      await sleep(500)
-      if (/\/messaging\/thread\//.test(page.url())) {
-        urls.add(page.url().split('?')[0] ?? page.url())
-      }
-    }
-
-    unchangedPasses = seenCards.size === before ? unchangedPasses + 1 : 0
-    const moved = await list
-      .evaluate((element) => {
-        const beforeScroll = element.scrollTop
-        element.scrollBy(0, Math.max(400, element.clientHeight * 0.8))
-        return element.scrollTop !== beforeScroll
-      })
-      .catch(() => false)
-    if (!moved && seenCards.size === before) unchangedPasses = 3
-    await sleep(600)
-  }
-
-  return { urls: [...urls], visibleConversations, inboxesScanned: [] }
-}
-
 async function selectInboxFolder(page: Page, folder: 'Focused' | 'Other'): Promise<boolean> {
   const trigger = page.getByRole('button', { name: /^(Focused|Other)$/ }).first()
-  await trigger.waitFor({ state: 'visible', timeout: 15_000 }).catch(() => undefined)
-  if (!(await trigger.count())) return false
+  await trigger.waitFor({ state: 'visible', timeout: 8_000 }).catch(() => undefined)
+  if (!(await trigger.count())) return folder === 'Focused'
   const current = (await trigger.innerText()).trim()
   if (current !== folder) {
     await trigger.click()
@@ -429,63 +474,151 @@ async function selectInboxFolder(page: Page, folder: 'Focused' | 'Other'): Promi
   return true
 }
 
-async function collectThreadUrls(page: Page, cutoff: Date): Promise<ThreadDiscovery> {
-  const urls = new Set<string>()
-  const inboxesScanned: string[] = []
-  let visibleConversations = 0
-  for (const folder of ['Focused', 'Other'] as const) {
-    const folderPage = folder === 'Focused' ? page : await page.context().newPage()
-    try {
-      if (folderPage !== page) {
-        await folderPage.goto('https://www.linkedin.com/messaging/', {
-          waitUntil: 'domcontentloaded',
-          timeout: 30_000,
+async function collectCurrentInboxThreads(
+  page: Page,
+  maxConversations: number,
+  since: Date,
+  now: Date,
+): Promise<{ threads: ThreadReference[]; visibleConversations: number }> {
+  const list = page
+    .locator(
+      '.msg-conversations-container__conversations-list, [aria-label*="Conversation" i], [class*="conversations-list"]',
+    )
+    .first()
+  await list.waitFor({ state: 'visible', timeout: 15_000 }).catch(() => undefined)
+  const threads = new Map<string, ThreadReference>()
+  const seenSummaries = new Set<string>()
+  let unchanged = 0
+  let consecutiveOld = 0
+
+  for (
+    let pass = 0;
+    pass < 120 && threads.size < maxConversations && unchanged < 4 && consecutiveOld < 4;
+    pass += 1
+  ) {
+    const before = threads.size
+    const controls = page.locator('.msg-conversation-listitem__link, a[href*="/messaging/thread/"]')
+    const count = await controls.count()
+    for (let index = 0; index < count && threads.size < maxConversations; index += 1) {
+      const control = controls.nth(index)
+      const summary = await control
+        .evaluate((element) => {
+          const row = element.closest<HTMLElement>('.msg-conversation-listitem')
+          return {
+            title:
+              row
+                ?.querySelector<HTMLElement>('.msg-conversation-listitem__participant-names')
+                ?.innerText.trim() ?? '',
+            snippet:
+              row
+                ?.querySelector<HTMLElement>(
+                  '.msg-conversation-card__message-snippet, .msg-conversation-card__message-snippet--v2',
+                )
+                ?.innerText.trim() ?? '',
+            time: row?.querySelector<HTMLElement>('time')?.innerText.trim() ?? '',
+          }
+        })
+        .catch(() => ({ title: '', snippet: '', time: '' }))
+      seenSummaries.add(`${summary.title}\n${summary.time}\n${summary.snippet}`)
+      const cardDate = parseLinkedInDateLabel(summary.time, now)
+      const clearlyOld = Boolean(cardDate && cardDate.getTime() + 86_400_000 < since.getTime())
+      if (clearlyOld) {
+        consecutiveOld += 1
+        continue
+      }
+      consecutiveOld = 0
+
+      const href = await control.getAttribute('href').catch(() => null)
+      let url = href?.includes('/messaging/thread/')
+        ? new URL(href, 'https://www.linkedin.com').toString().split('?')[0]!
+        : null
+      if (!url) {
+        await control.evaluate((element) => (element as HTMLElement).click()).catch(() => undefined)
+        await page.waitForTimeout(400)
+        if (/\/messaging\/thread\//.test(page.url())) url = page.url().split('?')[0]!
+      }
+      if (url) {
+        threads.set(url, {
+          url,
+          title: summary.title,
+          snippet: summary.snippet,
+          timestampRaw: summary.time,
         })
       }
-      if (!(await selectInboxFolder(folderPage, folder))) continue
-      inboxesScanned.push(folder)
-      const result = await collectCurrentInboxThreadUrls(folderPage, cutoff)
-      visibleConversations += result.visibleConversations
-      for (const url of result.urls) {
-        if (urls.size >= MAX_THREADS_PER_SYNC) break
-        urls.add(url)
-      }
-    } finally {
-      if (folderPage !== page) await folderPage.close().catch(() => undefined)
     }
+    unchanged = threads.size === before ? unchanged + 1 : 0
+    const moved = await list
+      .evaluate((element) => {
+        const beforeScroll = element.scrollTop
+        element.scrollBy(0, Math.max(500, element.clientHeight * 0.85))
+        return element.scrollTop !== beforeScroll
+      })
+      .catch(() => false)
+    if (!moved && threads.size === before) unchanged = 4
+    await page.waitForTimeout(650)
   }
-  return { urls: [...urls], visibleConversations, inboxesScanned }
+  return { threads: [...threads.values()], visibleConversations: seenSummaries.size }
 }
 
-async function extractThreadMessages(page: Page): Promise<RawLinkedInMessage[]> {
-  const messageSelector = '.msg-s-event-listitem'
-  await page.waitForSelector(messageSelector, { timeout: 5_000 }).catch(() => undefined)
-
-  const messageList = page.locator('.msg-s-message-list').first()
-  let unchangedPasses = 0
-  for (let pass = 0; pass < 8 && unchangedPasses < 2; pass += 1) {
-    const before = await page.locator(messageSelector).count()
-    await messageList
-      .evaluate((element) => element.scrollTo(0, -element.scrollHeight))
-      .catch(() => undefined)
-    await sleep(600)
-    const after = await page.locator(messageSelector).count()
-    unchangedPasses = after === before ? unchangedPasses + 1 : 0
+async function collectThreads(page: Page, since: Date): Promise<ThreadDiscovery> {
+  const threads = new Map<string, ThreadReference>()
+  const inboxesScanned: string[] = []
+  const now = new Date()
+  let visibleConversations = 0
+  for (const folder of ['Focused', 'Other'] as const) {
+    if (threads.size >= MAX_THREADS_PER_SYNC) break
+    if (!(await selectInboxFolder(page, folder))) continue
+    inboxesScanned.push(folder)
+    const found = await collectCurrentInboxThreads(
+      page,
+      MAX_THREADS_PER_SYNC - threads.size,
+      since,
+      now,
+    )
+    visibleConversations += found.visibleConversations
+    for (const thread of found.threads) threads.set(thread.url, thread)
   }
+  return { threads: [...threads.values()], inboxesScanned, visibleConversations }
+}
 
-  return page
-    .locator(messageSelector)
+async function scrollAllMessages(page: Page): Promise<void> {
+  const messages = page.locator('.msg-s-event-listitem')
+  const list = page.locator('.msg-s-message-list, [class*="message-list"]').first()
+  let unchanged = 0
+  for (let pass = 0; pass < 80 && unchanged < 4; pass += 1) {
+    const before = await messages.count()
+    await list.evaluate((element) => element.scrollTo(0, -element.scrollHeight)).catch(() => undefined)
+    await page.waitForTimeout(750)
+    const after = await messages.count()
+    unchanged = after === before ? unchanged + 1 : 0
+  }
+}
+
+async function extractThreadMessages(
+  page: Page,
+  thread: ThreadReference,
+): Promise<RawLinkedInMessage[]> {
+  await page.goto(thread.url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
+  await page
+    .locator('.msg-s-event-listitem')
+    .first()
+    .waitFor({ state: 'attached', timeout: 12_000 })
+    .catch(() => undefined)
+  await scrollAllMessages(page)
+
+  const extracted = await page
+    .locator('.msg-s-event-listitem')
     .evaluateAll((nodes) => {
       let lastSender = ''
-      let lastDateLabel = ''
-      let lastGroupTime = ''
+      let lastDate = ''
+      let lastTime = ''
       return nodes.flatMap((node) => {
         const element = node as HTMLElement
         const group = element.closest<HTMLElement>('li.msg-s-message-list__event')
-        const dateHeading = group
+        const date = group
           ?.querySelector<HTMLElement>('.msg-s-message-list__time-heading')
           ?.innerText.trim()
-        if (dateHeading) lastDateLabel = dateHeading
+        if (date) lastDate = date
         const senderElement = element.querySelector<HTMLElement>(
           '.msg-s-message-group__name, [class*="message-group__name"], [data-anonymize="person-name"]',
         )
@@ -497,77 +630,116 @@ async function extractThreadMessages(page: Page): Promise<RawLinkedInMessage[]> 
               '.msg-s-event-listitem__body, .msg-s-message-group__msg-text, [class*="event-listitem__body"], [class*="message-bubble"]',
             )
             ?.innerText.trim() ?? ''
-        if (!body) return []
-        const groupTime =
-          element.querySelector<HTMLElement>('.msg-s-message-group__timestamp')?.innerText.trim() ||
-          group?.querySelector<HTMLElement>('.msg-s-message-group__timestamp')?.innerText.trim() ||
-          lastGroupTime
-        if (groupTime) lastGroupTime = groupTime
-        const timestamp = `${lastDateLabel}||${groupTime}`
-        const senderLink =
-          element.querySelector<HTMLAnchorElement>('a[href*="/in/"]') ??
-          group?.querySelector<HTMLAnchorElement>('a[href*="/in/"]') ??
-          senderElement?.closest<HTMLAnchorElement>('a[href*="/in/"]')
         const links = Array.from(element.querySelectorAll<HTMLAnchorElement>('a[href]')).map((link) => ({
           href: link.href,
           text: link.innerText.trim(),
           download: link.getAttribute('download'),
         }))
-        const eventClasses = typeof element.className === 'string' ? element.className : ''
-        const outbound = !/msg-s-event-listitem--other/.test(eventClasses)
+        if (!body && links.length === 0) return []
+        const time =
+          element.querySelector<HTMLElement>('.msg-s-message-group__timestamp')?.innerText.trim() ??
+          group?.querySelector<HTMLElement>('.msg-s-message-group__timestamp')?.innerText.trim()
+        if (time) lastTime = time
+        const senderLink =
+          element.querySelector<HTMLAnchorElement>('a[href*="/in/"]') ??
+          group?.querySelector<HTMLAnchorElement>('a[href*="/in/"]')
+        const classes = typeof element.className === 'string' ? element.className : ''
         return [
           {
-            id:
-              element.dataset.eventUrn ??
-              element.getAttribute('data-event-urn') ??
-              '',
+            id: element.dataset.eventUrn || element.getAttribute('data-event-urn') || '',
             body,
             senderName,
             senderProfileUrl: senderLink?.href ?? null,
-            timestamp,
-            outbound,
+            timestamp: `${lastDate}||${lastTime}`,
+            outbound: !/msg-s-event-listitem--other/.test(classes),
             links,
           },
         ]
       })
     })
     .catch(() => [])
+
+  return extracted.map((message) => ({
+    ...message,
+    id:
+      message.id ||
+      crypto
+        .createHash('sha256')
+        .update(
+          `${thread.url}\n${message.senderProfileUrl ?? message.senderName}\n${message.timestamp}\n${message.body}`,
+        )
+        .digest('hex'),
+  }))
+}
+
+function messageFromSummary(
+  thread: ThreadReference,
+  since: Date,
+  now: Date,
+): RawLinkedInMessage[] {
+  if (!thread.snippet) return []
+  const timeOnly = /^\d{1,2}:\d{2}\s*(?:AM|PM)$/i.test(thread.timestampRaw)
+  const timestamp = timeOnly ? `Today||${thread.timestampRaw}` : `${thread.timestampRaw}||`
+  const parsed = parseLinkedInMessageDate(timestamp, now)
+  if (!parsed || parsed < since) return []
+  const outbound = /^you\s*:/i.test(thread.snippet)
+  return [
+    {
+      id: crypto
+        .createHash('sha256')
+        .update(`${thread.url}\n${thread.timestampRaw}\n${thread.snippet}`)
+        .digest('hex'),
+      body: thread.snippet,
+      senderName: outbound ? 'You' : thread.title,
+      senderProfileUrl: null,
+      timestamp,
+      outbound,
+      links: [],
+    },
+  ]
 }
 
 export function extractReferrals(messages: RawLinkedInMessage[], cutoff: Date): ExtractedReferral[] {
-  return messages.flatMap((message) => {
-    if (message.outbound || !isReferralRequest(message.body)) return []
-    const receivedAt = parseLinkedInMessageDate(message.timestamp)
-    if (!receivedAt || receivedAt < cutoff) return []
-    const resume = resumeLink(message.links)
-    return [
-      {
-        externalMessageId:
-          message.id ||
-          crypto
-            .createHash('sha256')
-            .update(`${message.senderProfileUrl ?? message.senderName}\n${message.timestamp}\n${message.body}`)
-            .digest('hex'),
-        requesterName: message.senderName || 'LinkedIn member',
-        requesterProfileUrl: normalizeLinkedInUrl(message.senderProfileUrl),
-        receivedAt,
-        targetRole: extractTargetRole(message.body),
-        jobRequisitionId: extractJobId(message.body),
-        resumeName: resume?.download || resume?.text || null,
-        resumeUrl: normalizeLinkedInUrl(resume?.href ?? null),
-        note: message.body,
-        links: message.links,
-      },
-    ]
-  })
+  const request = messages
+    .flatMap((message) => {
+      if (message.outbound || !isReferralRequest(message.body)) return []
+      const receivedAt = parseLinkedInMessageDate(message.timestamp)
+      if (!receivedAt || receivedAt < cutoff) return []
+      return [{ message, receivedAt }]
+    })
+    .sort((left, right) => left.receivedAt.getTime() - right.receivedAt.getTime())[0]
+  if (!request) return []
+
+  const resume = resumeLink(request.message.links)
+  return [
+    {
+      externalMessageId:
+        request.message.id ||
+        crypto
+          .createHash('sha256')
+          .update(
+            `${request.message.senderProfileUrl ?? request.message.senderName}\n${request.message.timestamp}\n${request.message.body}`,
+          )
+          .digest('hex'),
+      requesterName: request.message.senderName || 'LinkedIn member',
+      requesterProfileUrl: normalizeLinkedInUrl(request.message.senderProfileUrl),
+      receivedAt: request.receivedAt,
+      targetRole: extractTargetRole(request.message.body),
+      jobRequisitionId: extractJobId(request.message.body),
+      resumeName: resume?.download || resume?.text || null,
+      resumeUrl: normalizeLinkedInUrl(resume?.href ?? null),
+      note: request.message.body,
+      links: request.message.links,
+    },
+  ]
 }
 
 async function saveResumeAttachment(
-  context: BrowserContext,
+  context: BrowserContext | null,
   userId: string,
   referral: ExtractedReferral,
 ): Promise<{ storagePath: string | null; name: string | null }> {
-  if (!referral.resumeUrl || !storageConfigured()) {
+  if (!context || !referral.resumeUrl || !storageConfigured()) {
     return { storagePath: null, name: referral.resumeName }
   }
   try {
@@ -591,8 +763,8 @@ async function saveResumeAttachment(
   }
 }
 
-async function persistReferral(
-  context: BrowserContext,
+export async function persistExtractedLinkedInReferral(
+  context: BrowserContext | null,
   userId: string,
   referrerName: string,
   referral: ExtractedReferral,
@@ -660,6 +832,64 @@ export async function syncLinkedInReferrals(
   const browser = await launchAutomationBrowser()
   const context = await browser.newContext({ storageState: credential.storageState })
   try {
+    const reference = await scrapeWithReferenceProject(lookbackDays)
+    if (reference) {
+      const cutoff = new Date(Date.now() - lookbackDays * 86_400_000)
+      let scannedMessages = 0
+      let datedMessages = 0
+      let recentMessages = 0
+      let recentInboundMessages = 0
+      let matchedMessages = 0
+      let imported = 0
+      let duplicates = 0
+      for (const messages of reference.conversations) {
+        scannedMessages += messages.length
+        const dated = messages.filter((message) => parseLinkedInMessageDate(message.timestamp) !== null)
+        datedMessages += dated.length
+        const recent = dated.filter((message) => {
+          const receivedAt = parseLinkedInMessageDate(message.timestamp)
+          return receivedAt !== null && receivedAt >= cutoff
+        })
+        recentMessages += recent.length
+        recentInboundMessages += recent.filter((message) => !message.outbound).length
+        const extracted = extractReferrals(messages, cutoff)
+        matchedMessages += extracted.length
+        for (const referral of extracted) {
+          const result = await persistExtractedLinkedInReferral(
+            context,
+            userId,
+            account.email,
+            referral,
+          )
+          if (result === 'inserted') imported += 1
+          else duplicates += 1
+        }
+      }
+      const syncedAt = new Date()
+      await updateAccount(userId, {
+        email: account.email,
+        externalUserId: account.externalUserId,
+        status: 'ready',
+        actionRequired: null,
+        lastVerifiedAt: syncedAt,
+        profileSyncedAt: syncedAt,
+      })
+      return {
+        inboxesScanned: ['Focused', 'Other'],
+        visibleConversations: reference.discoveredConversations,
+        scannedThreads: reference.conversations.length,
+        scannedMessages,
+        datedMessages,
+        recentMessages,
+        recentInboundMessages,
+        matchedMessages,
+        imported,
+        duplicates,
+        lookbackDays,
+        syncedAt: syncedAt.toISOString(),
+      }
+    }
+
     const page = await context.newPage()
     await page.goto('https://www.linkedin.com/messaging/', {
       waitUntil: 'domcontentloaded',
@@ -678,10 +908,11 @@ export async function syncLinkedInReferrals(
     }
 
     const cutoff = new Date(Date.now() - lookbackDays * 86_400_000)
-    const threadDiscovery = await collectThreadUrls(page, cutoff)
+    const threadDiscovery = await collectThreads(page, cutoff)
     if (threadDiscovery.inboxesScanned.length === 0) {
       throw conflict('LinkedIn inbox did not load. Reconnect LinkedIn, then try again.')
     }
+    const now = new Date()
     let scannedMessages = 0
     let datedMessages = 0
     let recentMessages = 0
@@ -689,12 +920,15 @@ export async function syncLinkedInReferrals(
     let matchedMessages = 0
     let imported = 0
     let duplicates = 0
-    for (const threadUrl of threadDiscovery.urls) {
-      await page
-        .goto(threadUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 })
-        .catch(() => undefined)
-      await page.waitForTimeout(500)
-      const messages = await extractThreadMessages(page)
+    for (const thread of threadDiscovery.threads) {
+      let messages: RawLinkedInMessage[]
+      try {
+        messages = await extractThreadMessages(page, thread)
+      } catch (error) {
+        logger.warn({ err: error, threadUrl: thread.url }, 'deep LinkedIn thread scrape failed')
+        messages = messageFromSummary(thread, cutoff, now)
+      }
+      if (messages.length === 0) messages = messageFromSummary(thread, cutoff, now)
       scannedMessages += messages.length
       const dated = messages.filter((message) => parseLinkedInMessageDate(message.timestamp) !== null)
       datedMessages += dated.length
@@ -707,10 +941,11 @@ export async function syncLinkedInReferrals(
       const extracted = extractReferrals(messages, cutoff)
       matchedMessages += extracted.length
       for (const referral of extracted) {
-        const result = await persistReferral(context, userId, account.email, referral)
+        const result = await persistExtractedLinkedInReferral(context, userId, account.email, referral)
         if (result === 'inserted') imported += 1
         else duplicates += 1
       }
+      await page.waitForTimeout(3_000)
     }
 
     const syncedAt = new Date()
@@ -730,7 +965,7 @@ export async function syncLinkedInReferrals(
     return {
       inboxesScanned: threadDiscovery.inboxesScanned,
       visibleConversations: threadDiscovery.visibleConversations,
-      scannedThreads: threadDiscovery.urls.length,
+      scannedThreads: threadDiscovery.threads.length,
       scannedMessages,
       datedMessages,
       recentMessages,
@@ -762,7 +997,7 @@ async function runScheduledSyncs(): Promise<void> {
     )
   for (const account of accounts) {
     if (syncingUsers.has(account.userId)) continue
-    await syncLinkedInReferrals(account.userId, account.profileSyncedAt ? 1 : 90).catch((error) => {
+    await syncLinkedInReferrals(account.userId, account.profileSyncedAt ? 1 : 7).catch((error) => {
       logger.error({ err: error, userId: account.userId }, 'scheduled LinkedIn referral sync failed')
     })
   }
