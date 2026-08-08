@@ -478,9 +478,26 @@ referralsRouter.post(
         note: body.note ?? null,
         matchScore: body.matchScore ?? null,
       })
+      .onConflictDoNothing()
       .returning()
 
-    if (!row) throw new Error('Referral insert returned no row')
+    if (!row) {
+      if (!body.externalMessageId) throw new Error('Referral insert returned no row')
+      const [existing] = await db
+        .select()
+        .from(referrals)
+        .where(
+          and(
+            eq(referrals.userId, auth.id),
+            eq(referrals.source, body.source),
+            eq(referrals.externalMessageId, body.externalMessageId),
+          ),
+        )
+        .limit(1)
+      if (!existing) throw new Error('Referral conflict row was not found')
+      ok(res, serializeReferral(existing), { duplicate: true })
+      return
+    }
 
     await recordActivity({
       userId: auth.id,
