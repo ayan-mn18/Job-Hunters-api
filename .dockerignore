@@ -1,0 +1,16 @@
+# Keeping .env out matters most: compose injects it at runtime via env_file, so
+# baking it into a layer would only leak it.
+.env
+.env.*
+!.env.example
+
+node_modules
+dist
+.git
+.gitignore
+*.md
+docs
+spikes
+Dockerfile*
+docker-compose.yml
+.DS_Store

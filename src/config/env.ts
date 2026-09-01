@@ -50,7 +50,61 @@ const schema = z.object({
   PORTAL_CREDENTIALS_KEY: z.string().min(43).optional(),
   CHROMIUM_EXECUTABLE_PATH: z.string().min(1).optional(),
   PORTAL_AUTOMATION_ENABLED: booleanish.default('false'),
+  /** Adds --no-sandbox and friends. Set by the runner image, not by hand. */
+  BROWSER_IN_CONTAINER: booleanish.default('false'),
+  /**
+   * Fill every field, screenshot the result, and stop before submitting.
+   *
+   * On by default. Turning it off is what makes the product send real
+   * applications to real employers on someone's behalf, and that should be a
+   * deliberate act rather than a default anyone inherits.
+   */
+  APPLY_DRY_RUN: booleanish.default('true'),
+  /** Stops every application immediately, without a redeploy. */
+  APPLY_KILL_SWITCH: booleanish.default('false'),
+  /** How long a blocked attempt waits for a human before parking. */
+  APPLY_TAKEOVER_WINDOW_MS: z.coerce.number().int().positive().default(5 * 60_000),
+  /** Opens a real window for interactive sign-in. Development only. */
+  AUTOMATION_HEADFUL: booleanish.default('false'),
 
+
+  /**
+   * Model access. Absent, the gateway reports itself as unconfigured and every
+   * model-backed feature degrades to its deterministic fallback rather than
+   * throwing — the same posture the storage and queue checks take.
+   */
+  ANTHROPIC_API_KEY: z.string().min(1).optional(),
+  /** Per-purpose overrides. All default to the general-purpose model. */
+  MODEL_DEFAULT: z.string().default('claude-opus-5'),
+  MODEL_RERANK: z.string().optional(),
+  MODEL_CLASSIFY: z.string().optional(),
+  MODEL_DRAFT: z.string().optional(),
+  /** Per-user monthly ceiling in USD. 0 disables the check. */
+  MODEL_MONTHLY_BUDGET_USD: z.coerce.number().min(0).default(20),
+
+  /**
+   * Tier-1 job search APIs. Each connector reports itself unavailable —
+   * rather than failing a run — when its key is missing, so a deployment can
+   * enable them one at a time.
+   *
+   * A Google-for-Jobs connector is what reaches LinkedIn, Naukri, Foundit and
+   * Indeed postings without touching anyone's account. Either provider works;
+   * whichever key is present is used.
+   */
+  JSEARCH_API_KEY: z.string().min(1).optional(),
+  SERPAPI_KEY: z.string().min(1).optional(),
+  ADZUNA_APP_ID: z.string().min(1).optional(),
+  ADZUNA_APP_KEY: z.string().min(1).optional(),
+  JOOBLE_API_KEY: z.string().min(1).optional(),
+
+  /**
+   * Gmail. `gmail.readonly` is a Google *restricted* scope: a published app
+   * needs an annual CASA assessment, but the OAuth consent screen's testing
+   * mode allows up to 100 manually added users for free. Start there.
+   */
+  GOOGLE_CLIENT_ID: z.string().min(1).optional(),
+  GOOGLE_CLIENT_SECRET: z.string().min(1).optional(),
+  GOOGLE_OAUTH_REDIRECT: z.string().url().optional(),
 
   MAX_RESUME_BYTES: z.coerce.number().int().positive().default(5 * 1024 * 1024),
   MAX_PHOTO_BYTES: z.coerce.number().int().positive().default(5 * 1024 * 1024),
@@ -108,5 +162,11 @@ export const hasSupabaseStorage = Boolean(env.SUPABASE_URL && env.SUPABASE_SERVI
 export const hasDatabase = Boolean(env.DATABASE_URL)
 export const hasRedis = Boolean(env.REDIS_URL)
 export const hasPortalCredentialVault = Boolean(env.PORTAL_CREDENTIALS_KEY)
+
+/** Model-backed features fall back to deterministic behaviour without this. */
+export const hasModelAccess = Boolean(env.ANTHROPIC_API_KEY)
+
+/** Gmail ingest is off until an OAuth client exists. */
+export const hasGmail = Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET)
 
 export type Env = typeof env

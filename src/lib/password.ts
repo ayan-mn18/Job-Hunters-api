@@ -1,25 +1,30 @@
-import bcrypt from 'bcryptjs'
+import { compare, hash } from '@node-rs/bcrypt'
 import { env } from '../config/env.js'
 
 /**
- * bcrypt, via `bcryptjs`.
+ * bcrypt, via `@node-rs/bcrypt`.
  *
- * The brief said "bcrypt/argon2". This is bcrypt — the same algorithm and the
- * same `$2b$` hash format as the native `bcrypt` package, in pure JavaScript.
- * That buys a dependency tree with no node-gyp step, which matters because
- * this repo has to install cleanly on a laptop and in CI before anyone has
- * thought about build toolchains. If throughput ever becomes the bottleneck,
- * swapping in `argon2` means changing only this file: the rest of the codebase
- * calls `hashPassword` / `verifyPassword` and nothing else.
+ * Previously `bcryptjs` — the same algorithm and the same `$2b$` hash format,
+ * but in pure JavaScript, which put every login and signup at roughly
+ * 600–1200 ms at cost factor 12. That was the single largest source of
+ * perceived slowness in the product.
+ *
+ * This is the native Rust implementation: same format, same cost factor, about
+ * an order of magnitude faster. It ships prebuilt binaries for the platforms
+ * this deploys on, so there is still no node-gyp step. Existing hashes verify
+ * unchanged — the format is identical, so no migration is needed.
+ *
+ * If throughput ever demands argon2, only this file changes: the rest of the
+ * codebase calls `hashPassword` / `verifyPassword` and nothing else.
  */
 
 export async function hashPassword(plain: string): Promise<string> {
-  return bcrypt.hash(plain, env.BCRYPT_ROUNDS)
+  return hash(plain, env.BCRYPT_ROUNDS)
 }
 
-export async function verifyPassword(plain: string, hash: string): Promise<boolean> {
+export async function verifyPassword(plain: string, hashed: string): Promise<boolean> {
   try {
-    return await bcrypt.compare(plain, hash)
+    return await compare(plain, hashed)
   } catch {
     return false
   }

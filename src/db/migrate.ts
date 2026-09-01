@@ -3,6 +3,7 @@ import { hasDatabase } from '../config/env.js'
 import { logger } from '../lib/logger.js'
 import { closeDatabase, getDb } from './client.js'
 import { syncPortalCatalogue } from './portal-catalogue.js'
+import { seedCompanyBoards } from '../hunt/discovery/board-resolver.js'
 
 /** Applies the SQL in ./migrations, then upserts the portal catalogue. */
 export async function runMigrations(): Promise<void> {
@@ -12,6 +13,9 @@ export async function runMigrations(): Promise<void> {
 
   const count = await syncPortalCatalogue()
   logger.info({ count }, 'portal catalogue synced')
+
+  const boards = await seedCompanyBoards()
+  logger.info({ seeded: boards }, 'company boards seeded')
 }
 
 async function main(): Promise<void> {

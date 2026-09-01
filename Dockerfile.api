@@ -1,0 +1,32 @@
+# The HTTP process. No browser, so this image stays small — the runner is the
+# one that carries Chromium.
+FROM node:22-slim AS build
+
+WORKDIR /app
+
+# Dependencies first, so a source-only change does not reinstall the world.
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+FROM node:22-slim AS runtime
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+# `--omit=dev` after the build, so tsx and drizzle-kit never reach production.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+COPY --from=build /app/dist ./dist
+COPY migrations ./migrations
+COPY drizzle.config.ts ./
+
+# Run unprivileged. The base image ships a `node` user for exactly this.
+USER node
+
+EXPOSE 46460
+CMD ["node", "dist/index.js"]
