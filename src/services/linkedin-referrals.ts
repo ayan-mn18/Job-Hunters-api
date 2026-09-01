@@ -1,12 +1,11 @@
 import crypto from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
-import { access, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { spawn } from 'node:child_process'
-import { and, eq, isNull, lt, or } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import type { BrowserContext, Page } from 'playwright-core'
-import { env, hasPortalCredentialVault } from '../config/env.js'
+import { hasPortalCredentialVault } from '../config/env.js'
 import { db } from '../db/client.js'
 import { portalAccounts, referrals, type PortalAccount } from '../db/schema.js'
 import { launchAutomationBrowser, launchInteractiveAutomationContext } from '../hunt/browser.js'
@@ -15,11 +14,10 @@ import { decryptCredential, encryptCredential } from '../lib/credential-vault.js
 import { logger } from '../lib/logger.js'
 import { buildObjectKey, storageConfigured, uploadObject } from '../lib/storage.js'
 import { recordActivity } from './activity.js'
+import { bucketFor, classifyThread, mightBeReferralRequest, type Bucket } from './referral-classify.js'
 import { getReferralDraftGenerator } from './referral-draft.js'
 
 const PORTAL_ID = 'linkedin-referrals'
-const DAILY_SYNC_MS = 24 * 60 * 60 * 1000
-const SCHEDULER_TICK_MS = 60 * 60 * 1000
 const CONNECT_TIMEOUT_MS = 10 * 60 * 1000
 const MAX_THREADS_PER_SYNC = 2_000
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
@@ -79,126 +77,29 @@ export interface LinkedInSyncResult {
   recentInboundMessages: number
   recentMessages: number
   matchedMessages: number
+  /** Threads the classifier could not call either way. Shown, not discarded. */
+  maybeThreads?: number
   imported: number
   duplicates: number
   lookbackDays: number
   syncedAt: string
 }
-interface ReferenceLinkedInExport {
-  conversations: Array<{
-    messages: Array<{
-      id: string
-      body: string
-      senderName: string
-      senderProfileUrl: string | null
-      timestampRaw: string
-      timestamp: string | null
-      outbound: boolean
-      links: RawLinkedInMessage['links']
-    }>
-  }>
-}
 
-interface ReferenceScrapeResult {
-  conversations: RawLinkedInMessage[][]
-  discoveredConversations: number
-}
 
-async function runProcess(
-  cwd: string,
-  args: string[],
-  timeoutMs: number,
-): Promise<string> {
-  const { promise, resolve, reject } = Promise.withResolvers<string>()
-  const child = spawn('npm', args, {
-    cwd,
-    env: process.env,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  let stdout = ''
-  let stderr = ''
-  child.stdout.on('data', (chunk: Buffer) => {
-    if (stdout.length < 50_000) stdout += chunk.toString('utf8')
-  })
-  child.stderr.on('data', (chunk: Buffer) => {
-    if (stderr.length < 20_000) stderr += chunk.toString('utf8')
-  })
-  child.once('error', reject)
-  child.once('exit', (code, signal) => {
-    if (code === 0) resolve(stdout)
-    else reject(new Error(`LinkedIn DM scraper exited ${code ?? signal}: ${stderr.trim()}`))
-  })
-  const timer = setTimeout(() => {
-    child.kill('SIGTERM')
-    reject(new Error('LinkedIn DM scraper timed out.'))
-  }, timeoutMs)
-  timer.unref()
-  try {
-    return await promise
-  } finally {
-    clearTimeout(timer)
-  }
-}
-
-async function scrapeWithReferenceProject(
-  lookbackDays: number,
-): Promise<ReferenceScrapeResult | null> {
-  const scraperDir = path.resolve(process.cwd(), '../linked-in-dm-scraper')
-  const profileDir = path.join(scraperDir, 'data/browser-profile')
-  try {
-    await Promise.all([access(path.join(scraperDir, 'package.json')), access(profileDir)])
-  } catch {
-    return null
-  }
-
-  const outputPath = path.join(scraperDir, 'data/linkedin-dms.json')
-  try {
-    const output = await runProcess(
-      scraperDir,
-      [
-        'run',
-        'scrape',
-        '--',
-        '--hours',
-        String(lookbackDays * 24),
-        '--max-conversations',
-        '1000',
-        '--conversation-scrolls',
-        '120',
-        '--message-scrolls',
-        '80',
-        '--delay-ms',
-        '3000',
-        '--profile-dir',
-        profileDir,
-        '--output',
-        outputPath,
-      ],
-      15 * 60 * 1000,
-    )
-    const parsed = JSON.parse(await readFile(outputPath, 'utf8')) as ReferenceLinkedInExport
-    const discoveredConversations = Number(
-      output.match(/Found (\d+) conversations/)?.[1] ?? parsed.conversations.length,
-    )
-    return {
-      conversations: parsed.conversations.map((conversation) =>
-        conversation.messages.map((message) => ({
-          id: message.id,
-          body: message.body,
-          senderName: message.senderName,
-          senderProfileUrl: message.senderProfileUrl,
-          timestamp: message.timestamp ?? message.timestampRaw,
-          outbound: message.outbound,
-          links: message.links,
-        })),
-      ),
-      discoveredConversations,
-    }
-  } catch (error) {
-    logger.warn({ err: error }, 'reference LinkedIn DM scraper failed; using session fallback')
-    return null
-  }
-}
+/**
+ * The subprocess path to the sibling `linked-in-dm-scraper` project used to
+ * live here: it shelled out to `npm run scrape` in `../linked-in-dm-scraper`
+ * and read the JSON it wrote.
+ *
+ * Removed for two reasons. It cannot be containerised — the sibling directory
+ * is outside the deployable unit and the child process needed npm on PATH. And
+ * more seriously, it drove a single on-disk browser profile, so in a
+ * multi-user deployment every user's referral sweep would have run through one
+ * person's LinkedIn login.
+ *
+ * The session path below is the correct one: each user's own encrypted
+ * `storageState`, one session at a time, under a per-user lock.
+ */
 
 const connectionJobs = new Map<string, Promise<void>>()
 const syncingUsers = new Set<string>()
@@ -326,7 +227,7 @@ async function connectLinkedInInBrowser(input: {
     await updateAccount(input.userId, {
       email: input.email,
       externalUserId: input.profileUrl,
-      encryptedCredentials: encryptCredential<LinkedInSessionCredential>({
+      encryptedCredentials: await encryptCredential<LinkedInSessionCredential>(input.userId, {
         kind: 'linkedin-storage-state',
         profileUrl: input.profileUrl,
         storageState,
@@ -699,6 +600,58 @@ function messageFromSummary(
   ]
 }
 
+/**
+ * Thread-level extraction.
+ *
+ * `extractReferrals` below decides from a single message body and four
+ * regexes. This reads the whole thread and asks the classifier, because a
+ * referral ask routinely spans three messages — a greeting, some context, then
+ * the request — and none of them contains the word "refer" on its own.
+ *
+ * The regex version stays as the cheap prefilter and as the fallback when no
+ * model is configured, so this never makes the feature worse.
+ */
+export async function extractReferralsFromThread(
+  userId: string,
+  messages: RawLinkedInMessage[],
+  cutoff: Date,
+): Promise<{ referrals: ExtractedReferral[]; bucket: Bucket; confidence: number }> {
+  const inbound = messages.filter((message) => !message.outbound)
+  const text = inbound.map((message) => message.body).join('\n')
+
+  // Cheap pass first: no point classifying a thread about someone's birthday.
+  if (!mightBeReferralRequest(text)) {
+    return { referrals: [], bucket: 'ignored', confidence: 0 }
+  }
+
+  const classification = await classifyThread(
+    userId,
+    messages.map((message) => ({
+      senderName: message.senderName,
+      body: message.body,
+      outbound: message.outbound,
+      sentAt: message.timestamp,
+    })),
+  )
+
+  const bucket = bucketFor(classification)
+  if (bucket === 'ignored') {
+    return { referrals: [], bucket, confidence: classification.confidence }
+  }
+
+  // Reuse the existing extraction for the message-level details — sender,
+  // links, résumé attachment — then let the classifier's reading win on the
+  // fields it can see across the whole thread.
+  const base = extractReferrals(messages, cutoff)
+  const referrals = base.map((referral) => ({
+    ...referral,
+    targetRole: classification.targetRole ?? referral.targetRole,
+    jobRequisitionId: classification.requisitionId ?? referral.jobRequisitionId,
+  }))
+
+  return { referrals, bucket, confidence: classification.confidence }
+}
+
 export function extractReferrals(messages: RawLinkedInMessage[], cutoff: Date): ExtractedReferral[] {
   const request = messages
     .flatMap((message) => {
@@ -825,71 +778,16 @@ export async function syncLinkedInReferrals(
   if (account.status !== 'ready' || !account.encryptedCredentials) {
     throw conflict(account.actionRequired || 'LinkedIn connection is not ready.')
   }
-  const credential = decryptCredential<LinkedInSessionCredential>(account.encryptedCredentials)
+  const credential = await decryptCredential<LinkedInSessionCredential>(
+    userId,
+    account.encryptedCredentials,
+  )
   if (credential.kind !== 'linkedin-storage-state') throw conflict('Stored LinkedIn session is invalid.')
 
   syncingUsers.add(userId)
   const browser = await launchAutomationBrowser()
   const context = await browser.newContext({ storageState: credential.storageState })
   try {
-    const reference = await scrapeWithReferenceProject(lookbackDays)
-    if (reference) {
-      const cutoff = new Date(Date.now() - lookbackDays * 86_400_000)
-      let scannedMessages = 0
-      let datedMessages = 0
-      let recentMessages = 0
-      let recentInboundMessages = 0
-      let matchedMessages = 0
-      let imported = 0
-      let duplicates = 0
-      for (const messages of reference.conversations) {
-        scannedMessages += messages.length
-        const dated = messages.filter((message) => parseLinkedInMessageDate(message.timestamp) !== null)
-        datedMessages += dated.length
-        const recent = dated.filter((message) => {
-          const receivedAt = parseLinkedInMessageDate(message.timestamp)
-          return receivedAt !== null && receivedAt >= cutoff
-        })
-        recentMessages += recent.length
-        recentInboundMessages += recent.filter((message) => !message.outbound).length
-        const extracted = extractReferrals(messages, cutoff)
-        matchedMessages += extracted.length
-        for (const referral of extracted) {
-          const result = await persistExtractedLinkedInReferral(
-            context,
-            userId,
-            account.email,
-            referral,
-          )
-          if (result === 'inserted') imported += 1
-          else duplicates += 1
-        }
-      }
-      const syncedAt = new Date()
-      await updateAccount(userId, {
-        email: account.email,
-        externalUserId: account.externalUserId,
-        status: 'ready',
-        actionRequired: null,
-        lastVerifiedAt: syncedAt,
-        profileSyncedAt: syncedAt,
-      })
-      return {
-        inboxesScanned: ['Focused', 'Other'],
-        visibleConversations: reference.discoveredConversations,
-        scannedThreads: reference.conversations.length,
-        scannedMessages,
-        datedMessages,
-        recentMessages,
-        recentInboundMessages,
-        matchedMessages,
-        imported,
-        duplicates,
-        lookbackDays,
-        syncedAt: syncedAt.toISOString(),
-      }
-    }
-
     const page = await context.newPage()
     await page.goto('https://www.linkedin.com/messaging/', {
       waitUntil: 'domcontentloaded',
@@ -918,6 +816,8 @@ export async function syncLinkedInReferrals(
     let recentMessages = 0
     let recentInboundMessages = 0
     let matchedMessages = 0
+    // Threads the classifier could not call either way, surfaced rather than lost.
+    let maybeThreads = 0
     let imported = 0
     let duplicates = 0
     for (const thread of threadDiscovery.threads) {
@@ -938,9 +838,14 @@ export async function syncLinkedInReferrals(
       })
       recentMessages += recent.length
       recentInboundMessages += recent.filter((message) => !message.outbound).length
-      const extracted = extractReferrals(messages, cutoff)
-      matchedMessages += extracted.length
-      for (const referral of extracted) {
+      // Thread-level: reads the whole conversation rather than one message,
+      // and routes anything it is unsure about to the "maybe" pile instead of
+      // dropping it. A missed referral request costs far more than one extra
+      // card to dismiss.
+      const classified = await extractReferralsFromThread(userId, messages, cutoff)
+      if (classified.bucket === 'maybe') maybeThreads += 1
+      matchedMessages += classified.referrals.length
+      for (const referral of classified.referrals) {
         const result = await persistExtractedLinkedInReferral(context, userId, account.email, referral)
         if (result === 'inserted') imported += 1
         else duplicates += 1
@@ -953,7 +858,7 @@ export async function syncLinkedInReferrals(
     await updateAccount(userId, {
       email: account.email,
       externalUserId: account.externalUserId,
-      encryptedCredentials: encryptCredential<LinkedInSessionCredential>({
+      encryptedCredentials: await encryptCredential<LinkedInSessionCredential>(userId, {
         ...credential,
         storageState: freshState,
       }),
@@ -971,6 +876,7 @@ export async function syncLinkedInReferrals(
       recentMessages,
       recentInboundMessages,
       matchedMessages,
+      maybeThreads,
       imported,
       duplicates,
       lookbackDays,
@@ -983,38 +889,10 @@ export async function syncLinkedInReferrals(
   }
 }
 
-async function runScheduledSyncs(): Promise<void> {
-  const staleBefore = new Date(Date.now() - DAILY_SYNC_MS)
-  const accounts = await db
-    .select()
-    .from(portalAccounts)
-    .where(
-      and(
-        eq(portalAccounts.portalId, PORTAL_ID),
-        eq(portalAccounts.status, 'ready'),
-        or(isNull(portalAccounts.profileSyncedAt), lt(portalAccounts.profileSyncedAt, staleBefore)),
-      ),
-    )
-  for (const account of accounts) {
-    if (syncingUsers.has(account.userId)) continue
-    await syncLinkedInReferrals(account.userId, account.profileSyncedAt ? 1 : 7).catch((error) => {
-      logger.error({ err: error, userId: account.userId }, 'scheduled LinkedIn referral sync failed')
-    })
-  }
-}
+/**
+ * Scheduling used to live here as a `setInterval` started by the web process.
+ * It is now a BullMQ job scheduler per user (see `queues/schedule.ts`), fired
+ * at an hour each user picks and consumed by the runner — an interval in the
+ * API duplicated on every replica and died with the dyno.
+ */
 
-export function startLinkedInReferralScheduler(): () => void {
-  if (!env.PORTAL_AUTOMATION_ENABLED || !hasPortalCredentialVault) {
-    logger.warn('LinkedIn referral scheduler disabled: automation or credential vault is unavailable.')
-    return () => undefined
-  }
-  const initial = setTimeout(() => void runScheduledSyncs(), 30_000)
-  initial.unref()
-  const interval = setInterval(() => void runScheduledSyncs(), SCHEDULER_TICK_MS)
-  interval.unref()
-  logger.info('LinkedIn referral scheduler started')
-  return () => {
-    clearTimeout(initial)
-    clearInterval(interval)
-  }
-}

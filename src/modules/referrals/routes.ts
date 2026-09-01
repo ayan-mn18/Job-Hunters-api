@@ -483,11 +483,14 @@ referralsRouter.patch(
 /**
  * Regenerate the recommendation.
  *
- * STUBBED: the generator assembles a template from the facts on the row. It
- * will not read the attached resume or the job description until the real one
- * is registered — see src/services/referral-draft.ts. The response flags this
- * with `stubbed: true` so the UI can badge it rather than pass it off as
- * finished writing.
+ * Which generator answers depends on the deployment: with a model configured
+ * it reads the résumé and the job description, and without one it assembles a
+ * template from the facts on the row.
+ *
+ * The response carries `stubbed` either way, so the UI badges a template as a
+ * template rather than passing it off as finished writing. That flag is read
+ * from the registered generator, not hardcoded — it tells the truth about
+ * whichever one is actually running.
  */
 referralsRouter.post(
   '/:id/draft',
