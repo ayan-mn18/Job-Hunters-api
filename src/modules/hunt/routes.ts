@@ -1,16 +1,26 @@
-import { and, desc, eq, inArray } from 'drizzle-orm'
+import { and, count, desc, eq, inArray } from 'drizzle-orm'
 import { Router } from 'express'
 import { z } from 'zod'
 import { db } from '../../db/client.js'
-import { huntRunJobs, huntRuns, huntSpecs, type HuntRun, type HuntSpec } from '../../db/schema.js'
+import {
+  huntCandidates,
+  huntRunJobs,
+  huntRuns,
+  huntSpecs,
+  searchQueries,
+  type HuntRun,
+  type HuntSpec,
+} from '../../db/schema.js'
 import { approveDailyBatch } from '../../hunt/approval.js'
-import { discoverForRun, listCandidates } from '../../hunt/discovery/service.js'
+import { listCandidates } from '../../hunt/discovery/service.js'
 import { rescoreHuntRun } from '../../hunt/rescore.js'
 import { conflict, notFound } from '../../lib/errors.js'
 import { asyncHandler, created, ok, pathParam } from '../../lib/http.js'
+import { logger } from '../../lib/logger.js'
 import { currentUser, requireAuth } from '../../middleware/auth.js'
 import { validate } from '../../middleware/validate.js'
 import { recordActivity } from '../../services/activity.js'
+import { getHuntQueue } from '../../services/hunt-queue.js'
 
 export const huntRouter: Router = Router()
 huntRouter.use(requireAuth)
@@ -165,33 +175,20 @@ huntRouter.post(
       .returning()
     if (!run) throw new Error('Could not create a hunt run')
 
-    try {
-      const discovery = await discoverForRun(auth.id, run.id)
-      const [updated] = await db.select().from(huntRuns).where(eq(huntRuns.id, run.id)).limit(1)
-      await recordActivity({
-        userId: auth.id,
-        kind: 'jobs_scraped',
-        text: `Found ${discovery.candidates.length} jobs ready for review.`,
-        meta: { runId: run.id, candidates: discovery.candidates.length },
-      })
-      created(res, {
-        ...serializeRun(updated ?? run),
-        candidates: discovery.candidates,
-        warnings: discovery.warnings,
-        sources: discovery.results.map((result) => ({
-          portal: result.portal,
-          seen: result.seen,
-          fresh: result.jobs.length,
-          error: result.error ?? null,
-        })),
-      })
-    } catch (error) {
-      await db
-        .update(huntRuns)
-        .set({ status: 'failed', error: error instanceof Error ? error.message : String(error), finishedAt: new Date(), updatedAt: new Date() })
-        .where(eq(huntRuns.id, run.id))
-      throw error
-    }
+    // Discovery talks to a dozen sources and takes twenty seconds or more, so
+    // it does not run here. It used to run as an unheld promise in this
+    // handler, which meant a deploy mid-scrape left the run stuck in `running`
+    // with nothing to finish it. The run row is created synchronously — so the
+    // client immediately has something to poll — and the work is queued.
+    const { jobId } = await getHuntQueue().enqueue({
+      runId: run.id,
+      userId: auth.id,
+      targetApplications: run.targetApplications,
+      minMatchScore: spec.minMatchScore,
+    })
+    logger.info({ runId: run.id, jobId }, 'discovery queued')
+
+    created(res, { ...serializeRun(run), candidates: [], warnings: [], sources: [] })
   }),
 )
 
@@ -223,6 +220,60 @@ huntRouter.post(
   }),
 )
 
+/**
+ * What this run actually searched for.
+ *
+ * The answer to "why didn't I see the job at X" used to be unavailable to
+ * anyone without database access. It is one of three things — the search was
+ * never issued, it was issued and returned nothing, or it returned the job and
+ * the scorer rejected it — and they need different fixes.
+ */
+huntRouter.get(
+  '/runs/:id/queries',
+  validate({ params: runParamSchema }),
+  asyncHandler(async (req, res) => {
+    const auth = currentUser(req)
+    const runId = pathParam(req, 'id')
+
+    const [run] = await db
+      .select({ id: huntRuns.id, progress: huntRuns.progress })
+      .from(huntRuns)
+      .where(and(eq(huntRuns.id, runId), eq(huntRuns.userId, auth.id)))
+      .limit(1)
+    if (!run) throw notFound('Hunt run not found')
+
+    const rows = await db
+      .select()
+      .from(searchQueries)
+      .where(eq(searchQueries.runId, runId))
+      .orderBy(desc(searchQueries.resultCount))
+
+    const progress = (run.progress ?? {}) as {
+      plan?: unknown
+      unavailable?: unknown
+    }
+
+    ok(res, {
+      plan: progress.plan ?? null,
+      unavailable: progress.unavailable ?? [],
+      queries: rows.map((row) => ({
+        connector: row.connectorId,
+        query: row.query,
+        market: row.market,
+        results: row.resultCount,
+        durationMs: row.durationMs,
+        error: row.error,
+      })),
+      // Crawl sources issue no queries, so an empty list here is not the same
+      // as "nothing was searched".
+      note:
+        rows.length === 0
+          ? 'No keyword searches were issued — only crawl sources ran. Configure a tier-1 search API to search by role and location.'
+          : null,
+    })
+  }),
+)
+
 huntRouter.post(
   '/stop',
   asyncHandler(async (req, res) => {
@@ -234,6 +285,10 @@ huntRouter.post(
       .orderBy(desc(huntRuns.createdAt))
       .limit(1)
     if (!run) throw notFound('No hunt is active.')
+
+    // Tell the queue first. A run still waiting is removed outright; one
+    // already executing sees the stop flag at its next checkpoint.
+    await getHuntQueue().requestStop(run.id)
 
     const [updated] = await db
       .update(huntRuns)
@@ -256,22 +311,33 @@ huntRouter.get(
   '/status',
   asyncHandler(async (req, res) => {
     const auth = currentUser(req)
-    const [latest] = await db
-      .select()
-      .from(huntRuns)
-      .where(eq(huntRuns.userId, auth.id))
-      .orderBy(desc(huntRuns.createdAt))
-      .limit(1)
-    const spec = await loadSpec(auth.id)
-    const candidates = latest?.status === 'awaiting_approval'
-      ? await listCandidates(auth.id, latest.id)
-      : []
+    // This endpoint is polled while a hunt runs. It used to join and serialise
+    // every candidate on each poll, which grew with the run and did the same
+    // work repeatedly; the count is what the screen actually shows, and the
+    // rows themselves are one request away on /hunt/runs/:id/candidates.
+    const [[latest], spec] = await Promise.all([
+      db
+        .select()
+        .from(huntRuns)
+        .where(eq(huntRuns.userId, auth.id))
+        .orderBy(desc(huntRuns.createdAt))
+        .limit(1),
+      loadSpec(auth.id),
+    ])
+    const awaitingApproval = latest?.status === 'awaiting_approval'
+    const [candidateCount] = awaitingApproval && latest
+      ? await db
+          .select({ value: count() })
+          .from(huntCandidates)
+          .where(and(eq(huntCandidates.runId, latest.id), eq(huntCandidates.userId, auth.id)))
+      : [{ value: 0 }]
+
     ok(res, {
       running: latest ? ['queued', 'running', 'applying'].includes(latest.status) : false,
-      awaitingApproval: latest?.status === 'awaiting_approval',
+      awaitingApproval,
       dailyTarget: spec.dailyTarget,
       currentRun: latest ? serializeRun(latest) : null,
-      candidates,
+      candidateCount: Number(candidateCount?.value ?? 0),
       queueStubbed: false,
     })
   }),
