@@ -110,8 +110,24 @@ All at 6/6 slots above the confidence bar afterwards. The cap of 7 was never
 reached — the impact floor stops it first, which is the mechanism doing the
 work rather than the ceiling.
 
-## Still to come
+## The apply-stage fields
 
-The `apply`-stage slots are deferred out of intake but nothing collects them
-yet. That belongs with the apply runtime: ask once, at the first application
-that needs the field, then reuse forever.
+Deferring these out of intake left a real gap for a while: the old wizard used
+to collect a phone number, adaptive intake correctly does not, and nothing
+replaced it. The first application would reach `loadPortalProfile`, throw
+"phone is required in My Kit", and reach the user as a *failed application*
+rather than a question.
+
+They are now collected at approval — the moment the user commits to applying,
+and the last moment before anything is queued. `readApplyFields` reports what
+is missing in two buckets: required (nothing can be submitted without it) and
+commonly asked (each missing one turns into a `needs_review` attempt, found out
+one application at a time, which is worse).
+
+The prompt is checked client-side before approving and enforced server-side in
+`approveDailyBatch`, because a precheck that fails should not be able to let a
+doomed run through.
+
+Answers are written to `kits`, which is where the apply runtime already reads
+them from. Deliberately not a new table: two homes for a phone number is how
+they drift apart.
