@@ -1,0 +1,1 @@
+ALTER TABLE "hunt_specs" ADD COLUMN "score_weights" jsonb;
