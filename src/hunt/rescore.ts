@@ -11,8 +11,9 @@ import {
 } from '../db/schema.js'
 import { badRequest, notFound } from '../lib/errors.js'
 import { readParsedResume } from '../services/resume-parser.js'
-import type { NormalisedLocation, ScrapedJob } from './discovery/types.js'
-import { rankJob } from './ranking.js'
+import { normaliseProfileSkills } from './discovery/extract/profile-skills.js'
+import { rankableFromJob } from './discovery/service.js'
+import { rankJob, readWeights } from './ranking.js'
 
 export async function rescoreHuntRun(userId: string, runId: string) {
   const [[run], [spec], [kit], [baseResume], rows] = await Promise.all([
@@ -34,26 +35,11 @@ export async function rescoreHuntRun(userId: string, runId: string) {
   if (rows.length === 0) throw badRequest('This run has no detailed jobs to re-score.')
 
   const parsed = readParsedResume(baseResume?.parsedProfile)
-  const profileSkills = [...new Set([...(kit?.skills ?? []), ...(parsed?.skills ?? [])])]
+  const profileSkills = normaliseProfileSkills([...(kit?.skills ?? []), ...(parsed?.skills ?? [])])
   const candidates: Array<typeof huntCandidates.$inferInsert> = []
+  const weights = readWeights(spec.scoreWeights)
   const decisions = rows.map(({ runJob, job }) => {
-    const scraped: ScrapedJob = {
-      sourceId: job.id,
-      portal: runJob.sourcePortal,
-      url: job.canonicalUrl,
-      applyUrl: job.applyUrl ?? undefined,
-      title: job.title,
-      company: job.company,
-      locations: job.locations as NormalisedLocation[],
-      remote: job.remoteMode as ScrapedJob['remote'],
-      descriptionText: job.descriptionText ?? undefined,
-      tags: job.skills,
-      postedAt: job.postedAt.toISOString(),
-      postedAtPrecision: job.postedAtPrecision as ScrapedJob['postedAtPrecision'],
-      fetchedAt: runJob.discoveredAt.toISOString(),
-      fingerprint: job.fingerprint,
-    }
-    const ranking = rankJob(scraped, {
+    const ranking = rankJob(rankableFromJob(job), {
       roles: spec.roles,
       locations: spec.locations,
       dreamCompanies: spec.dreamCompanies,
@@ -61,6 +47,7 @@ export async function rescoreHuntRun(userId: string, runId: string) {
       skills: profileSkills,
       maxYearsExperience: kit?.maxYearsExperience ?? 5,
       minMatchScore: spec.minMatchScore,
+      weights,
     })
     if (ranking.accepted) {
       candidates.push({

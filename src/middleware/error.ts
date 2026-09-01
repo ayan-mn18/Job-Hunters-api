@@ -24,6 +24,15 @@ interface NormalisedError {
   details?: unknown
 }
 
+function nestedErrorCode(error: unknown): string | undefined {
+  let current = error as { code?: unknown; cause?: unknown } | null
+  for (let depth = 0; current && depth < 6; depth += 1) {
+    if (typeof current.code === 'string') return current.code
+    current = current.cause as { code?: unknown; cause?: unknown } | null
+  }
+  return undefined
+}
+
 /**
  * Turns anything thrown anywhere into the one error envelope the client sees.
  * The rule: known, expected failures keep their message; everything else
@@ -75,7 +84,7 @@ function normalise(error: unknown): NormalisedError {
   }
 
   // Postgres error codes worth translating rather than swallowing.
-  const pgCode = (error as { code?: string } | null)?.code
+  const pgCode = nestedErrorCode(error)
   if (pgCode === '23505') {
     return { status: 409, code: 'conflict', message: 'That record already exists.' }
   }
@@ -122,7 +131,10 @@ export const errorHandler: ErrorRequestHandler = (
       ...(normalised.details ? { details: normalised.details } : {}),
       requestId: req.requestId,
       // Stacks in development only. Never in production.
-      ...(!isProduction && normalised.status >= 500 && error instanceof Error
+      ...(!isProduction
+      && normalised.status >= 500
+      && normalised.code !== 'database_unavailable'
+      && error instanceof Error
         ? { stack: error.stack }
         : {}),
     },

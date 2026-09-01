@@ -42,20 +42,23 @@ export interface UserDto {
  * together for the client.
  */
 export async function buildKitDraft(userId: string): Promise<Partial<KitDraftDto>> {
-  const [kitRow] = await db.select().from(kits).where(eq(kits.userId, userId)).limit(1)
-  const [specRow] = await db.select().from(huntSpecs).where(eq(huntSpecs.userId, userId)).limit(1)
-
-  const connectedPortals = await db
-    .select({ portalId: userPortals.portalId })
-    .from(userPortals)
-    .where(and(eq(userPortals.userId, userId), eq(userPortals.connected, true)))
-
-  const [baseResume] = await db
-    .select({ fileName: resumes.fileName })
-    .from(resumes)
-    .where(and(eq(resumes.userId, userId), eq(resumes.isBase, true)))
-    .orderBy(desc(resumes.createdAt))
-    .limit(1)
+  // These four reads are independent, and this function sits on the critical
+  // path of sign-in, sign-up and every token refresh. Run serially they cost
+  // four network round trips to the database; in parallel they cost one.
+  const [[kitRow], [specRow], connectedPortals, [baseResume]] = await Promise.all([
+    db.select().from(kits).where(eq(kits.userId, userId)).limit(1),
+    db.select().from(huntSpecs).where(eq(huntSpecs.userId, userId)).limit(1),
+    db
+      .select({ portalId: userPortals.portalId })
+      .from(userPortals)
+      .where(and(eq(userPortals.userId, userId), eq(userPortals.connected, true))),
+    db
+      .select({ fileName: resumes.fileName })
+      .from(resumes)
+      .where(and(eq(resumes.userId, userId), eq(resumes.isBase, true)))
+      .orderBy(desc(resumes.createdAt))
+      .limit(1),
+  ])
 
   const draft: Partial<KitDraftDto> = {}
 

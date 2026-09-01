@@ -1,125 +1,146 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { extractRequiredExperienceYears, rankJob } from './ranking.js'
-import type { ScrapedJob } from './discovery/types.js'
+import { DEFAULT_WEIGHTS, rankJob, readWeights, requiredSkillsOf, type RankableJob } from './ranking.js'
 
-function job(overrides: Partial<ScrapedJob> = {}): ScrapedJob {
+/** The real profile this is tuned for: backend Java + full-stack TypeScript. */
+const profile = {
+  roles: ['Sr. SWE', 'Senior Software Engineer', 'Full Stack Engineer'],
+  locations: ['Remote', 'Bengaluru', 'Dubai'],
+  dreamCompanies: [],
+  dealBreakers: [],
+  skills: [
+    'Java', 'Spring Boot', 'JavaScript', 'TypeScript', 'React', 'Next.js', 'Node.js',
+    'SQL', 'PostgreSQL', 'MongoDB', 'Kafka', 'Redis', 'Docker', 'Kubernetes', 'AWS',
+    'REST APIs', 'Microservices', 'Distributed systems', 'CI/CD', 'Jenkins', 'Nginx',
+  ],
+  maxYearsExperience: 5,
+  minMatchScore: 75,
+}
+
+function job(overrides: Partial<RankableJob> = {}): RankableJob {
   return {
-    sourceId: '1',
-    portal: 'greenhouse',
-    url: 'https://example.test/jobs/1',
-    title: 'Senior TypeScript Engineer',
-    company: 'Careem',
-    locations: [{ raw: 'Dubai, United Arab Emirates', city: 'Dubai', countryCode: 'AE', isRemote: false }],
+    title: 'Senior Software Engineer',
+    company: 'Acme',
+    locations: [{ raw: 'Bengaluru, India', city: 'Bengaluru', countryCode: 'IN', isRemote: false }],
     remote: 'onsite',
-    descriptionText: 'Build TypeScript, React and Node.js services.',
+    skills: ['Java', 'Spring Boot', 'PostgreSQL', 'Kafka', 'REST APIs'],
+    experience: { min: 3, max: null, text: '3+ years' },
+    descriptionText: [
+      'Requirements',
+      '• 3+ years of experience building backend services.',
+      '• Strong Java and Spring Boot.',
+      '• PostgreSQL, Kafka and REST APIs.',
+    ].join('\n'),
     tags: [],
-    postedAt: '2026-08-08T00:00:00.000Z',
-    postedAtPrecision: 'exact',
-    fetchedAt: '2026-08-08T01:00:00.000Z',
-    fingerprint: 'fingerprint',
     ...overrides,
   }
 }
 
-const profile = {
-  roles: ['Senior Software Engineer', 'Senior Frontend Engineer', 'Senior Backend Engineer'],
-  locations: ['Dubai', 'Remote'],
-  dreamCompanies: ['Careem'],
-  dealBreakers: ['unpaid'],
-  skills: ['TypeScript', 'React', 'Node.js', 'Java', 'PostgreSQL'],
-  maxYearsExperience: 5,
-  minMatchScore: 70,
-}
-
 describe('job ranking', () => {
-  it('accepts strong senior software engineering matches', () => {
+  it('scores a job built on the candidate stack near the top', () => {
     const result = rankJob(job(), profile)
-    assert.equal(result.accepted, true)
     assert.equal(result.decision, 'eligible')
-    assert.ok(result.score >= 70)
-    assert.equal(result.breakdown.company, 5)
-    assert.deepEqual(result.matchedSkills, ['TypeScript', 'React', 'Node.js'])
+    assert.ok(result.score >= 90, `expected >= 90, got ${result.score}`)
+    assert.equal(result.missingSkills.length, 0)
   })
 
-  it('rejects explicit deal breakers regardless of score', () => {
-    const result = rankJob(job({ descriptionText: 'Unpaid position using TypeScript and React.' }), profile)
-    assert.equal(result.accepted, false)
-    assert.equal(result.score, 0)
-    assert.match(result.reasons[0] ?? '', /Deal breaker/)
-  })
-
-  it('rejects country-restricted remote roles', () => {
-    const result = rankJob(job({
-      company: 'Example',
-      locations: [{ raw: 'Remote, United States', countryCode: 'US', isRemote: true }],
-      remote: 'remote',
-    }), { ...profile, dreamCompanies: [] })
-    assert.equal(result.accepted, false)
-    assert.equal(result.decision, 'location_mismatch')
-    assert.match(result.reasons.join(' '), /restricted/)
-  })
-
-  it('rejects QA despite matching technologies', () => {
-    const result = rankJob(job({ title: 'Senior QA Automation Engineer' }), profile)
-    assert.equal(result.decision, 'role_mismatch')
-    assert.match(result.reasons[0] ?? '', /testing or QA/)
-  })
-
-  it('rejects software engineers in test', () => {
-    const result = rankJob(job({ title: 'Senior Software Development Engineer in Test' }), profile)
-    assert.equal(result.decision, 'role_mismatch')
-  })
-
-  it('rejects product management roles', () => {
-    const result = rankJob(job({ title: 'Senior Product Manager, Developer Platform' }), profile)
-    assert.equal(result.decision, 'role_mismatch')
-  })
-
-  it('rejects principal, staff, and lead roles', () => {
-    for (const title of ['Principal Software Engineer', 'Staff Backend Engineer', 'Lead Frontend Engineer']) {
+  it('rejects non-software roles outright, with no score', () => {
+    for (const title of [
+      'Technical Program Manager',
+      'Product Designer',
+      'Freelance Copywriter',
+      'Machine Learning Engineer',
+      'Senior QA Automation Engineer',
+      'Enterprise Account Executive',
+    ]) {
       const result = rankJob(job({ title }), profile)
-      assert.equal(result.decision, 'role_mismatch')
-      assert.match(result.reasons[0] ?? '', /principal, staff, or lead/)
+      assert.equal(result.decision, 'role_mismatch', title)
+      assert.equal(result.score, 0, title)
+      assert.equal(result.accepted, false, title)
     }
   })
 
-  it('rejects jobs requiring over five years', () => {
-    const result = rankJob(job({
-      descriptionText: 'Requires 7+ years of experience building TypeScript, React and Node.js services.',
-    }), profile)
-    assert.equal(result.decision, 'experience_mismatch')
-    assert.match(result.reasons[0] ?? '', /Requires 7 years/)
+  it('measures coverage of what the posting asks for, not raw overlap', () => {
+    // Same five of the candidate's skills appear in both, but the second
+    // posting asks for far more that the candidate does not have.
+    const focused = rankJob(job(), profile)
+    const sprawling = rankJob(
+      job({
+        skills: ['Java', 'Spring Boot', 'PostgreSQL', 'Kafka', 'REST APIs', 'Scala', 'Elixir', 'Haskell', 'Clojure', 'Erlang'],
+        descriptionText: [
+          'Requirements',
+          '• Strong Java, Spring Boot, PostgreSQL, Kafka and REST APIs.',
+          '• Also Scala, Elixir, Haskell, Clojure and Erlang in production.',
+        ].join('\n'),
+      }),
+      profile,
+    )
+    assert.ok(
+      sprawling.breakdown.coverage < focused.breakdown.coverage,
+      `${sprawling.breakdown.coverage} should be under ${focused.breakdown.coverage}`,
+    )
+    assert.ok(sprawling.missingSkills.length > 0)
   })
 
-  it('accepts experience requirements up to five years', () => {
-    const result = rankJob(job({
-      descriptionText: 'Requires 5+ years of experience building TypeScript, React and Node.js services.',
-    }), profile)
+  it('reports which required skills are missing', () => {
+    const result = rankJob(
+      job({
+        skills: ['Python', 'Django', 'PostgreSQL'],
+        descriptionText: 'Requirements\n• Strong Python and Django.\n• PostgreSQL in production.',
+      }),
+      profile,
+    )
+    assert.ok(result.missingSkills.includes('Python'))
+    assert.ok(result.missingSkills.includes('Django'))
+    assert.ok(result.matchedSkills.includes('PostgreSQL'))
+  })
+
+  it('prefers a backend role over a mobile one with the same coverage', () => {
+    const backend = rankJob(job({ title: 'Senior Backend Engineer' }), profile)
+    const mobile = rankJob(job({ title: 'Senior Android Engineer' }), profile)
+    assert.ok(mobile.score < backend.score)
+  })
+
+  it('keeps a remote worldwide role scoring well', () => {
+    const result = rankJob(
+      job({ locations: [{ raw: 'Remote, Worldwide', isRemote: true }], remote: 'remote' }),
+      profile,
+    )
     assert.equal(result.decision, 'eligible')
   })
 
-  it('extracts minimum years from ranges', () => {
-    assert.equal(extractRequiredExperienceYears('Need 3-5 years of professional experience.'), 3)
-    assert.equal(extractRequiredExperienceYears('Experience: 8 years.'), 8)
+  it('drops a country-restricted remote role below the bar', () => {
+    const result = rankJob(
+      job({
+        locations: [{ raw: 'Remote, United States', countryCode: 'US', isRemote: true }],
+        remote: 'remote',
+      }),
+      profile,
+    )
+    assert.ok(result.score < 75, `expected under 75, got ${result.score}`)
+    assert.equal(result.decision, 'location_mismatch')
   })
 
-  it('rejects working student software roles', () => {
-    const result = rankJob(job({ title: 'Working Student Software Engineer' }), profile)
-    assert.equal(result.decision, 'role_mismatch')
+  it('penalises experience far above the ceiling', () => {
+    const senior = rankJob(job({ experience: { min: 12, max: null, text: '12+ years' } }), profile)
+    assert.equal(senior.breakdown.experience, 0)
+    assert.ok(senior.score < rankJob(job(), profile).score)
   })
 
-  it('rejects roles lacking senior seniority', () => {
-    const result = rankJob(job({ title: 'Software Engineer' }), profile)
-    assert.equal(result.decision, 'seniority_mismatch')
+  it('caps how many skills a posting can demand', () => {
+    const required = requiredSkillsOf(
+      job({
+        descriptionText: `Requirements\n${Array.from({ length: 40 }, (_, i) => `• Skill ${i} with Java and React and Python and Go and Rust and Kafka.`).join('\n')}`,
+      }),
+    )
+    assert.ok(required.length <= 12, `got ${required.length}`)
   })
 
-  it('requires at least three confirmed skills', () => {
-    const result = rankJob(job({
-      title: 'Senior Backend Engineer',
-      descriptionText: 'Build services using Java and PostgreSQL.',
-    }), profile)
-    assert.equal(result.decision, 'insufficient_skills')
-    assert.equal(result.matchedSkills.length, 2)
+  it('normalises custom weights back to a 100-point scale', () => {
+    const weights = readWeights({ coverage: 90, stack: 40, experience: 24, seniority: 16, location: 30 })
+    const total = Object.values(weights).reduce((sum, value) => sum + value, 0)
+    assert.ok(Math.abs(total - 100) < 0.001)
+    assert.deepEqual(readWeights(null), DEFAULT_WEIGHTS)
+    assert.deepEqual(readWeights({ nonsense: true }), DEFAULT_WEIGHTS)
   })
 })

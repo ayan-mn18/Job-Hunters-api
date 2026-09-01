@@ -65,6 +65,11 @@ const jobsQuerySchema = z
     minScore: z.coerce.number().int().min(0).max(100).optional(),
     maxScore: z.coerce.number().int().min(0).max(100).optional(),
     remote: z.enum(['remote', 'hybrid', 'onsite', 'unknown']).optional(),
+    /**
+     * "Asks for at most N years." Postings that never state a figure are
+     * excluded rather than assumed to qualify — the filter means what it says.
+     */
+    maxExperience: z.coerce.number().int().min(0).max(50).optional(),
     foundOn: isoDay.optional(),
     postedOn: isoDay.optional(),
   })
@@ -75,35 +80,39 @@ const jobsQuerySchema = z
 const jobDetailQuerySchema = z.object({ runId: z.string().uuid() })
 const jobParamSchema = z.object({ jobId: z.string().uuid() })
 
-function salaryFromText(value: string | null): string | null {
-  if (!value) return null
-  const matches = value.matchAll(
-    /[$€£₹]\s?[\d,.]+(?:\.\d+)?\s?(?:k|m|l|lakh|lakhs|crore|crores)?(?:\s*(?:-|–|—|to)\s*[$€£₹]?\s?[\d,.]+(?:\.\d+)?\s?(?:k|m|l|lakh|lakhs|crore|crores)?)?(?:\s*(?:per\s+(?:hour|month|year)|hourly|monthly|yearly|\/hr|\/mo|\/yr|p\.a\.|lpa))?/gi,
-  )
-  for (const match of matches) {
-    const candidate = match[0].replace(/\s+/g, ' ').trim()
-    const start = match.index ?? 0
-    const context = value.slice(Math.max(0, start - 80), start + match[0].length + 80)
-    const explicitPayContext = /salary|compensation|base pay|pay range|annual pay|remuneration/i.test(context)
-    const range = /(?:-|–|—|\bto\b)/i.test(candidate)
-    if (explicitPayContext || range) return candidate
-  }
-  return null
+/**
+ * Salary and experience are parsed once, at scrape time, and stored. This used
+ * to run a regex over every description on every request — the same answer,
+ * recomputed per page view, and unfilterable because it existed only in the
+ * response.
+ */
+function salaryOf(job: {
+  salaryText: string | null
+  salaryMin: string | null
+  salaryMax: string | null
+  salaryCurrency: string | null
+  salaryPeriod: string | null
+}): string | null {
+  if (job.salaryText) return job.salaryText
+  const min = job.salaryMin === null ? null : Number(job.salaryMin)
+  const max = job.salaryMax === null ? null : Number(job.salaryMax)
+  if (min === null && max === null) return null
+  const format = (value: number): string => Math.round(value).toLocaleString('en-US')
+  const body = min !== null && max !== null && min !== max
+    ? `${format(min)}–${format(max)}`
+    : format((min ?? max) as number)
+  return `${job.salaryCurrency ? `${job.salaryCurrency} ` : ''}${body}${job.salaryPeriod ? ` per ${job.salaryPeriod}` : ''}`
 }
-function plainDescription(value: string | null): string {
-  if (!value) return ''
-  return value
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/\s+/g, ' ')
-    .trim()
+
+function experienceOf(job: { experienceMin: number | null; experienceMax: number | null }): string | null {
+  const { experienceMin: min, experienceMax: max } = job
+  if (min === null && max === null) return null
+  const unit = (value: number): string => (value === 1 ? 'year' : 'years')
+  if (min !== null && max !== null && min !== max) return `${min}–${max} ${unit(max)}`
+  if (min === 0 && max === null) return 'No experience required'
+  if (min !== null && max === null) return `${min}+ ${unit(min)}`
+  const only = (max ?? min) as number
+  return `${only} ${unit(only)}`
 }
 
 
@@ -355,6 +364,7 @@ dashboardRouter.get(
       query.minScore !== undefined ? gte(huntRunJobs.score, query.minScore) : undefined,
       query.maxScore !== undefined ? lte(huntRunJobs.score, query.maxScore) : undefined,
       query.remote ? eq(jobs.remoteMode, query.remote) : undefined,
+      query.maxExperience !== undefined ? lte(jobs.experienceMin, query.maxExperience) : undefined,
       query.foundOn
         ? sql`${localDate(huntRunJobs.discoveredAt)} = ${query.foundOn}::date`
         : undefined,
@@ -369,11 +379,6 @@ dashboardRouter.get(
       eq(huntRunJobs.runId, run.id),
       eq(huntRunJobs.userId, auth.id),
     )
-    const [detailedRunCount] = await db
-      .select({ value: count() })
-      .from(huntRunJobs)
-      .where(baseDetailedWhere)
-    const historical = Number(detailedRunCount?.value ?? 0) === 0
     const offset = (query.page - 1) * query.pageSize
 
     let counts: Record<string, number> = { all: 0 }
@@ -381,18 +386,24 @@ dashboardRouter.get(
     let items: Array<Record<string, unknown>> = []
     let total = 0
 
+    // The status counts double as the "is this run detailed?" check: their sum
+    // is the run's row count, so the extra count query this used to run first —
+    // serially, before anything else could start — is gone.
+    const statusRows = await db
+      .select({ status: huntRunJobs.status, value: count() })
+      .from(huntRunJobs)
+      .where(baseDetailedWhere)
+      .groupBy(huntRunJobs.status)
+    const detailedRunTotal = statusRows.reduce((sum, row) => sum + Number(row.value), 0)
+    const historical = detailedRunTotal === 0
+
     if (!historical) {
-      const [totalRow, statusRows, portalRows, detailed] = await Promise.all([
+      const [totalRow, portalRows, detailed] = await Promise.all([
         db
           .select({ value: count() })
           .from(huntRunJobs)
           .innerJoin(jobs, eq(huntRunJobs.jobId, jobs.id))
           .where(detailedWhere),
-        db
-          .select({ status: huntRunJobs.status, value: count() })
-          .from(huntRunJobs)
-          .where(baseDetailedWhere)
-          .groupBy(huntRunJobs.status),
         db
           .select({ portal: huntRunJobs.sourcePortal, value: count() })
           .from(huntRunJobs)
@@ -420,7 +431,7 @@ dashboardRouter.get(
           .offset(offset),
       ])
       total = Number(totalRow[0]?.value ?? 0)
-      counts = { all: Number(detailedRunCount?.value ?? 0) }
+      counts = { all: detailedRunTotal }
       for (const row of statusRows) counts[row.status] = Number(row.value)
       portals = Object.fromEntries(portalRows.map((row) => [row.portal, Number(row.value)]))
       items = detailed.map(({ runJob, job, candidateId, candidateStatus }) => ({
@@ -431,12 +442,17 @@ dashboardRouter.get(
         company: job.company,
         locations: job.locations,
         remote: job.remoteMode,
+        employmentType: job.employmentType,
         sourcePortal: runJob.sourcePortal,
         status: runJob.status,
         candidateStatus,
         score: runJob.score,
         skills: job.skills,
-        salary: salaryFromText(job.descriptionText),
+        salary: salaryOf(job),
+        experience: experienceOf(job),
+        experienceMin: job.experienceMin,
+        experienceMax: job.experienceMax,
+        responsibilities: job.responsibilities,
         jobUrl: job.canonicalUrl,
         postedAt: job.postedAt.toISOString(),
         discoveredAt: runJob.discoveredAt.toISOString(),
@@ -458,6 +474,7 @@ dashboardRouter.get(
             )
           : undefined,
         query.remote ? eq(jobs.remoteMode, query.remote) : undefined,
+        query.maxExperience !== undefined ? lte(jobs.experienceMin, query.maxExperience) : undefined,
         query.foundOn ? sql`${localDate(jobSources.fetchedAt)} = ${query.foundOn}::date` : undefined,
         query.postedOn ? sql`${localDate(jobs.postedAt)} = ${query.postedOn}::date` : undefined,
         query.portal ? eq(jobSources.portalId, query.portal) : undefined,
@@ -501,12 +518,17 @@ dashboardRouter.get(
         company: job.company,
         locations: job.locations,
         remote: job.remoteMode,
+        employmentType: job.employmentType,
         sourcePortal,
         status: 'scraped',
         candidateStatus: null,
         score: null,
         skills: job.skills,
-        salary: salaryFromText(job.descriptionText),
+        salary: salaryOf(job),
+        experience: experienceOf(job),
+        experienceMin: job.experienceMin,
+        experienceMax: job.experienceMax,
+        responsibilities: job.responsibilities,
         jobUrl: job.canonicalUrl,
         postedAt: job.postedAt.toISOString(),
         discoveredAt: new Date(discoveredAt).toISOString(),
@@ -545,47 +567,44 @@ dashboardRouter.get(
     const auth = currentUser(req)
     const query = validatedQuery<z.infer<typeof jobDetailQuerySchema>>(req)
     const jobId = pathParam(req, 'jobId')
-    const [run] = await db
-      .select()
-      .from(huntRuns)
-      .where(and(eq(huntRuns.id, query.runId), eq(huntRuns.userId, auth.id)))
-      .limit(1)
-    if (!run) throw notFound('Hunt run not found')
 
-    const [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1)
-    if (!job) throw notFound('Job not found')
-    const [runJob] = await db
-      .select()
-      .from(huntRunJobs)
-      .where(
+    // One round trip instead of five. The run, the job, this user's row for it,
+    // the candidate and the source it came from are all reachable by join, and
+    // the old sequential version paid full network latency for each.
+    const [row] = await db
+      .select({
+        run: huntRuns,
+        job: jobs,
+        runJob: huntRunJobs,
+        candidate: huntCandidates,
+        source: jobSources,
+      })
+      .from(huntRuns)
+      .innerJoin(jobs, eq(jobs.id, jobId))
+      .leftJoin(
+        huntRunJobs,
         and(
-          eq(huntRunJobs.runId, run.id),
+          eq(huntRunJobs.runId, huntRuns.id),
+          eq(huntRunJobs.jobId, jobs.id),
           eq(huntRunJobs.userId, auth.id),
-          eq(huntRunJobs.jobId, job.id),
         ),
       )
-      .limit(1)
-    const windowStart = run.startedAt ?? run.createdAt
-    const windowEnd = run.finishedAt ?? new Date()
-    const [source] = await db
-      .select()
-      .from(jobSources)
-      .where(
-        and(
-          eq(jobSources.jobId, job.id),
-          runJob
-            ? eq(jobSources.portalId, runJob.sourcePortal)
-            : and(gte(jobSources.fetchedAt, windowStart), lte(jobSources.fetchedAt, windowEnd)),
-        ),
+      .leftJoin(
+        huntCandidates,
+        and(eq(huntCandidates.runId, huntRuns.id), eq(huntCandidates.jobId, jobs.id)),
       )
-      .orderBy(desc(jobSources.fetchedAt))
+      .leftJoin(jobSources, eq(jobSources.jobId, jobs.id))
+      .where(and(eq(huntRuns.id, query.runId), eq(huntRuns.userId, auth.id)))
+      // Prefer the source row for the portal this run used, then the newest.
+      .orderBy(
+        desc(sql`(${jobSources.portalId} is not distinct from ${huntRunJobs.sourcePortal})`),
+        desc(jobSources.fetchedAt),
+      )
       .limit(1)
+
+    if (!row) throw notFound('Hunt run not found')
+    const { run, job, runJob, candidate, source } = row
     if (!runJob && !source) throw notFound('Job was not found in this hunt run')
-    const [candidate] = await db
-      .select()
-      .from(huntCandidates)
-      .where(and(eq(huntCandidates.runId, run.id), eq(huntCandidates.jobId, job.id)))
-      .limit(1)
 
     ok(res, {
       id: runJob?.id ?? `historical:${run.id}:${job.id}`,
@@ -595,6 +614,7 @@ dashboardRouter.get(
       company: job.company,
       locations: job.locations,
       remote: job.remoteMode,
+      employmentType: job.employmentType,
       sourcePortal: runJob?.sourcePortal ?? source?.portalId ?? '',
       status: runJob?.status ?? 'scraped',
       candidateStatus: candidate?.status ?? null,
@@ -602,8 +622,14 @@ dashboardRouter.get(
       scoreBreakdown: runJob?.scoreBreakdown ?? candidate?.scoreBreakdown ?? null,
       reasons: runJob?.reasons ?? candidate?.reasons ?? [],
       skills: job.skills,
-      salary: salaryFromText(job.descriptionText),
-      description: plainDescription(job.descriptionText),
+      salary: salaryOf(job),
+      experience: experienceOf(job),
+      experienceMin: job.experienceMin,
+      experienceMax: job.experienceMax,
+      experienceText: job.experienceText,
+      responsibilities: job.responsibilities,
+      description: job.descriptionText ?? '',
+      descriptionHtml: job.descriptionHtml,
       jobUrl: job.canonicalUrl,
       applyUrl: job.applyUrl ?? source?.applyUrl ?? null,
       postedAt: job.postedAt.toISOString(),

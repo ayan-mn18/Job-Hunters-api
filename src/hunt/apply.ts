@@ -2,7 +2,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { and, eq, sql } from 'drizzle-orm'
-import type { Locator, Page } from 'playwright-core'
+import type { Page } from 'playwright-core'
 import { db } from '../db/client.js'
 import {
   applications,
@@ -15,17 +15,17 @@ import {
   resumeVariants,
   type HuntRunJob,
 } from '../db/schema.js'
+import { env } from '../config/env.js'
 import { badRequest, notFound } from '../lib/errors.js'
+import { logger } from '../lib/logger.js'
 import { buildObjectKey, downloadObject, uploadObject } from '../lib/storage.js'
 import { launchAutomationBrowser } from './browser.js'
-import { loadPortalProfile, type PortalProfile } from './portal-profile.js'
+import { loadPortalProfile } from './portal-profile.js'
 import { provisionPortalAccount } from './portal-accounts.js'
 import { createMinimalResumeVariant } from './tailoring.js'
-interface FieldAudit {
-  label: string
-  kind: string
-  value: string
-}
+import { fillForm, submitForm } from './apply/fill.js'
+import { transition } from './apply/state.js'
+import { awaitTakeover, isWatched, startScreencast } from './apply/screencast.js'
 
 
 async function setRunJobStatus(runId: string, jobId: string, status: HuntRunJob['status']): Promise<void> {
@@ -34,82 +34,9 @@ async function setRunJobStatus(runId: string, jobId: string, status: HuntRunJob[
     .set({ status, updatedAt: new Date() })
     .where(and(eq(huntRunJobs.runId, runId), eq(huntRunJobs.jobId, jobId)))
 }
-async function fillFirst(locator: Locator, value: string, audit: FieldAudit[], label: string): Promise<boolean> {
-  if (!value || await locator.count() === 0) return false
-  const control = locator.first()
-  if (!(await control.isVisible())) return false
-  await control.fill(value)
-  audit.push({ label, kind: 'text', value: '[provided]' })
-  return true
-}
 
-function labels(page: Page, pattern: RegExp): Locator {
-  return page.getByLabel(pattern).or(page.getByPlaceholder(pattern))
-}
 
-async function fillStandardFields(page: Page, profile: PortalProfile, resumePath: string): Promise<FieldAudit[]> {
-  const audit: FieldAudit[] = []
-  const parts = profile.fullName.trim().split(/\s+/)
-  const firstName = parts[0] ?? profile.fullName
-  const lastName = parts.slice(1).join(' ')
 
-  await fillFirst(labels(page, /full name|name/i), profile.fullName, audit, 'fullName')
-  await fillFirst(labels(page, /first name/i), firstName, audit, 'firstName')
-  await fillFirst(labels(page, /last name|surname/i), lastName, audit, 'lastName')
-  await fillFirst(labels(page, /email/i), profile.email, audit, 'email')
-  await fillFirst(labels(page, /phone|mobile/i), profile.phone, audit, 'phone')
-  await fillFirst(labels(page, /address/i), profile.address.line1, audit, 'address')
-  await fillFirst(labels(page, /city/i), profile.address.city, audit, 'city')
-  await fillFirst(labels(page, /state|province|region/i), profile.address.region, audit, 'region')
-  await fillFirst(labels(page, /postal|zip|pin code/i), profile.address.postalCode, audit, 'postalCode')
-  await fillFirst(labels(page, /linkedin/i), profile.links.linkedin, audit, 'linkedin')
-  await fillFirst(labels(page, /github/i), profile.links.github, audit, 'github')
-  await fillFirst(labels(page, /portfolio|website/i), profile.links.portfolio, audit, 'portfolio')
-  await fillFirst(labels(page, /notice period|start date|availability/i), profile.noticePeriod, audit, 'noticePeriod')
-  await fillFirst(labels(page, /work authori[sz]ation|sponsorship/i), profile.workAuthorization, audit, 'workAuthorization')
-
-  const fileInputs = page.locator('input[type="file"]')
-  for (let index = 0; index < await fileInputs.count(); index += 1) {
-    const input = fileInputs.nth(index)
-    const name = `${await input.getAttribute('name') ?? ''} ${await input.getAttribute('id') ?? ''}`
-    const accept = await input.getAttribute('accept') ?? ''
-    if (/resume|cv/i.test(name) || /pdf|document|word/i.test(accept) || await fileInputs.count() === 1) {
-      await input.setInputFiles(resumePath)
-      audit.push({ label: 'resume', kind: 'file', value: path.basename(resumePath) })
-      break
-    }
-  }
-
-  const country = page.getByLabel(/country/i).first()
-  if (profile.address.country && await country.count() > 0 && await country.isVisible()) {
-    try {
-      await country.selectOption({ label: profile.address.country })
-      audit.push({ label: 'country', kind: 'select', value: profile.address.country })
-    } catch {
-      // A required unmapped country stays visible to the unresolved-field gate.
-    }
-  }
-  return audit
-}
-
-async function unresolvedRequired(page: Page): Promise<Array<{ label: string; type: string }>> {
-  return page.locator('input[required],select[required],textarea[required]').evaluateAll((controls) =>
-    controls.flatMap((control) => {
-      const element = control as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement
-      if (element.disabled || element.type === 'hidden') return []
-      const empty = element instanceof HTMLInputElement && ['checkbox', 'radio'].includes(element.type)
-        ? !element.checked
-        : !element.value.trim()
-      if (!empty) return []
-      const explicit = element.id ? document.querySelector(`label[for="${CSS.escape(element.id)}"]`)?.textContent : null
-      const wrapping = element.closest('label')?.textContent
-      return [{
-        label: (explicit || wrapping || element.getAttribute('aria-label') || element.name || element.id || 'Required field').trim(),
-        type: element.type || element.tagName.toLowerCase(),
-      }]
-    }),
-  )
-}
 
 async function persistEvidence(userId: string, attemptId: string, page: Page): Promise<string> {
   const screenshot = await page.screenshot({ fullPage: true, type: 'png' })
@@ -118,7 +45,11 @@ async function persistEvidence(userId: string, attemptId: string, page: Page): P
   return key
 }
 
-export async function applyApprovedCandidate(userId: string, candidateId: string): Promise<void> {
+export async function applyApprovedCandidate(
+  userId: string,
+  candidateId: string,
+  options?: { dryRun?: boolean },
+): Promise<void> {
   const [candidateState] = await db
     .select({ resumeVariantId: huntCandidates.resumeVariantId, runId: huntCandidates.runId })
     .from(huntCandidates)
@@ -226,28 +157,98 @@ export async function applyApprovedCandidate(userId: string, candidateId: string
   await setRunJobStatus(row.candidate.runId, row.candidate.jobId, 'applying')
   const scratch = await mkdtemp(path.join(os.tmpdir(), 'huntly-apply-'))
   const browser = await launchAutomationBrowser()
+  const dryRun = options?.dryRun ?? env.APPLY_DRY_RUN
+  // Declared out here so the `finally` can stop it however the attempt ends.
+  let screencast: Awaited<ReturnType<typeof startScreencast>> | null = null
+
   try {
+    await transition({ attemptId: attempt.id, userId, state: 'opening', detail: { applyUrl, dryRun } })
+
     const resumePath = path.join(scratch, row.variant.fileName)
     await writeFile(resumePath, await downloadObject(row.variant.storagePath))
     const page = await browser.newPage()
     await page.goto(applyUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 })
 
-    const applyLink = page.getByRole('link', { name: /apply|apply now|apply for this job/i }).first()
-    if (await applyLink.count() > 0 && await applyLink.isVisible()) {
-      await applyLink.click()
-      await page.waitForLoadState('domcontentloaded').catch(() => undefined)
-    }
+    // Stream only when somebody has the live view open. An unwatched
+    // application should cost nothing extra.
+    screencast = (await isWatched(attempt.id))
+      ? await startScreencast({ page, userId, attemptId: attempt.id })
+      : null
 
-    const audit = await fillStandardFields(page, profile, resumePath)
-    const unresolved = await unresolvedRequired(page)
-    if (unresolved.length > 0) {
+    await transition({ attemptId: attempt.id, userId, state: 'filling' })
+    const result = await fillForm({
+      page,
+      url: applyUrl,
+      userId,
+      attemptId: attempt.id,
+      profile,
+      resumePath,
+    })
+
+    const audit = result.fields.map((field) => ({
+      label: field.label,
+      kind: field.via,
+      value: field.filled ? '[provided]' : '[blank]',
+    }))
+
+    if (result.unresolved.length > 0) {
       const evidenceStoragePath = await persistEvidence(userId, attempt.id, page)
+      await transition({
+        attemptId: attempt.id,
+        userId,
+        state: 'blocked',
+        reason: result.unresolved[0]?.why ?? 'needs_input',
+        detail: {
+          fields: result.unresolved,
+          recipe: result.recipe,
+          takeoverWindowMs: env.APPLY_TAKEOVER_WINDOW_MS,
+        },
+      })
+
+      // Hold the page open for a few minutes so the user can finish it in the
+      // same browser. This is the difference between handing someone a broken
+      // attempt afterwards and letting them rescue it while it is still live.
+      if (await isWatched(attempt.id)) {
+        const outcome = await awaitTakeover({
+          page,
+          attemptId: attempt.id,
+          windowMs: env.APPLY_TAKEOVER_WINDOW_MS,
+        })
+        logger.info({ attemptId: attempt.id, outcome }, 'takeover window closed')
+        if (outcome === 'released') {
+          // They said they are done. Re-read the form and carry on from
+          // wherever they left it, rather than starting over.
+          const recheck = await fillForm({
+            page,
+            url: applyUrl,
+            userId,
+            attemptId: attempt.id,
+            profile,
+            resumePath,
+          })
+          if (recheck.unresolved.length === 0) {
+            await transition({ attemptId: attempt.id, userId, state: 'submitting', detail: { dryRun, afterTakeover: true } })
+            const retried = await submitForm({ page, url: applyUrl, dryRun })
+            if (retried.submitted) {
+              await transition({ attemptId: attempt.id, userId, state: 'submitted', detail: { afterTakeover: true } })
+              await db.update(applyAttempts).set({
+                status: 'submitted',
+                evidenceStoragePath: await persistEvidence(userId, attempt.id, page),
+                completedAt: new Date(),
+                updatedAt: new Date(),
+              }).where(eq(applyAttempts.id, attempt.id))
+              await db.update(huntCandidates).set({ status: 'applied', updatedAt: new Date() }).where(eq(huntCandidates.id, candidateId))
+              await db.update(applications).set({ status: 'applied', appliedAt: new Date(), updatedAt: new Date() }).where(eq(applications.id, application.id))
+              await setRunJobStatus(row.candidate.runId, row.candidate.jobId, 'applied')
+              return
+            }
+          }
+        }
+      }
       await db.update(applyAttempts).set({
-        status: 'needs_review',
         submittedFields: audit,
-        unresolvedFields: unresolved,
+        unresolvedFields: result.unresolved,
         evidenceStoragePath,
-        completedAt: new Date(),
         updatedAt: new Date(),
       }).where(eq(applyAttempts.id, attempt.id))
       await db.update(huntCandidates).set({ status: 'needs_review', updatedAt: new Date() }).where(eq(huntCandidates.id, candidateId))
@@ -260,24 +261,50 @@ export async function applyApprovedCandidate(userId: string, candidateId: string
       return
     }
 
-    const submit = page.getByRole('button', { name: /submit application|submit|apply now|send application/i }).first()
-    if (await submit.count() === 0 || !(await submit.isVisible())) {
-      throw new Error('No visible final submit control was found.')
-    }
-    await submit.click()
-    await page.waitForLoadState('domcontentloaded', { timeout: 15_000 }).catch(() => undefined)
-    const body = (await page.locator('body').innerText()).toLowerCase()
-    if (!/thank you|application (was )?submitted|successfully applied|we have received/.test(body)) {
-      throw new Error('Portal did not show a positive submission confirmation.')
+    await transition({ attemptId: attempt.id, userId, state: 'submitting', detail: { dryRun } })
+    const outcome = await submitForm({ page, url: applyUrl, dryRun })
+    const evidenceStoragePath = await persistEvidence(userId, attempt.id, page)
+
+    if (!outcome.submitted) {
+      // A dry run is a success, not a failure: the form was filled and the
+      // screenshot proves it. Recording it as an error would make the safe
+      // mode look broken and push people to turn it off.
+      const heldBack = outcome.heldBack === 'dry_run' || outcome.heldBack === 'kill_switch'
+      await transition({
+        attemptId: attempt.id,
+        userId,
+        state: heldBack ? 'skipped' : 'blocked',
+        ...(heldBack ? {} : { reason: 'needs_input' as const }),
+        detail: { heldBack: outcome.heldBack ?? null, recipe: result.recipe },
+      })
+      await db.update(applyAttempts).set({
+        status: heldBack ? 'pending' : 'needs_review',
+        submittedFields: audit,
+        unresolvedFields: heldBack ? [] : [{ label: 'Submit control', type: 'button' }],
+        evidenceStoragePath,
+        completedAt: new Date(),
+        updatedAt: new Date(),
+      }).where(eq(applyAttempts.id, attempt.id))
+      await db.update(huntCandidates).set({
+        status: heldBack ? 'tailored' : 'needs_review',
+        updatedAt: new Date(),
+      }).where(eq(huntCandidates.id, candidateId))
+      if (!heldBack) {
+        await db.update(applications).set({ status: 'needs_review', updatedAt: new Date() }).where(eq(applications.id, application.id))
+        await setRunJobStatus(row.candidate.runId, row.candidate.jobId, 'needs_review')
+      }
+      logger.info(
+        { attemptId: attempt.id, heldBack: outcome.heldBack, fields: audit.length },
+        heldBack ? 'application filled but not submitted' : 'application could not be submitted',
+      )
+      return
     }
 
-    const evidenceStoragePath = await persistEvidence(userId, attempt.id, page)
+    await transition({ attemptId: attempt.id, userId, state: 'submitted', detail: { recipe: result.recipe } })
     await db.update(applyAttempts).set({
-      status: 'submitted',
       submittedFields: audit,
       unresolvedFields: [],
       evidenceStoragePath,
-      completedAt: new Date(),
       updatedAt: new Date(),
     }).where(eq(applyAttempts.id, attempt.id))
     await db.update(huntCandidates).set({ status: 'applied', updatedAt: new Date() }).where(eq(huntCandidates.id, candidateId))
@@ -288,10 +315,14 @@ export async function applyApprovedCandidate(userId: string, candidateId: string
     }).where(eq(huntRuns.id, row.candidate.runId))
     await setRunJobStatus(row.candidate.runId, row.candidate.jobId, 'applied')
   } catch (error) {
+    await transition({
+      attemptId: attempt.id,
+      userId,
+      state: 'failed',
+      detail: { message: error instanceof Error ? error.message : String(error) },
+    })
     await db.update(applyAttempts).set({
-      status: 'unknown',
       error: error instanceof Error ? error.message : String(error),
-      completedAt: new Date(),
       updatedAt: new Date(),
     }).where(eq(applyAttempts.id, attempt.id))
     await db.update(huntCandidates).set({ status: 'needs_review', updatedAt: new Date() }).where(eq(huntCandidates.id, candidateId))
@@ -299,6 +330,7 @@ export async function applyApprovedCandidate(userId: string, candidateId: string
     await setRunJobStatus(row.candidate.runId, row.candidate.jobId, 'needs_review')
     throw error
   } finally {
+    await screencast?.stop().catch(() => undefined)
     await browser.close()
     await rm(scratch, { recursive: true, force: true })
   }

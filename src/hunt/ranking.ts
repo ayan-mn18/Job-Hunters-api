@@ -1,5 +1,26 @@
+import { extractSkills } from './discovery/extract/skills.js'
+import { splitSections } from './discovery/extract/sections.js'
+import { IMPLIED_BY, SKILL_TAXONOMY, TECHNICAL_CATEGORIES } from './discovery/extract/taxonomy.js'
 import { keywordTokens } from './discovery/normalise.js'
-import type { NormalisedLocation, ScrapedJob } from './discovery/types.js'
+import { classifyRole, type SoftwareFamily } from './role-filter.js'
+import type { ExperienceRange, NormalisedLocation, RemoteMode } from './discovery/types.js'
+
+/**
+ * Scoring.
+ *
+ * The score answers one question: **can this candidate do this job?** So the
+ * skill component measures how much of what the posting *asks for* the
+ * candidate already has — not, as it did before, how many of the candidate's
+ * skills happen to appear somewhere in the text. Those are different
+ * questions, and the old one rewarded long postings for mentioning things.
+ *
+ * A posting that wants six technologies and the candidate has five of them
+ * scores near the top. A posting that wants twenty, of which the candidate has
+ * five, does not, even though the raw overlap is identical.
+ *
+ * Role suitability is not scored at all — `role-filter.ts` gates it, because a
+ * product manager role is not a 60% software engineering job.
+ */
 
 export type RankingDecision =
   | 'eligible'
@@ -11,6 +32,62 @@ export type RankingDecision =
   | 'location_mismatch'
   | 'below_threshold'
 
+export interface ScoreWeights {
+  /** Share of the posting's required skills the candidate has. */
+  coverage: number
+  /** How much of the posting's stack is the candidate's own day-to-day stack. */
+  stack: number
+  experience: number
+  seniority: number
+  location: number
+}
+
+export const DEFAULT_WEIGHTS: ScoreWeights = {
+  coverage: 45,
+  stack: 20,
+  experience: 12,
+  seniority: 8,
+  location: 15,
+}
+
+export function readWeights(value: unknown): ScoreWeights {
+  if (!value || typeof value !== 'object') return DEFAULT_WEIGHTS
+  const raw = value as Partial<Record<keyof ScoreWeights, unknown>>
+  const weights = { ...DEFAULT_WEIGHTS }
+  let touched = false
+  for (const key of Object.keys(DEFAULT_WEIGHTS) as Array<keyof ScoreWeights>) {
+    const candidate = Number(raw[key])
+    if (Number.isFinite(candidate) && candidate >= 0 && candidate <= 100) {
+      weights[key] = candidate
+      touched = true
+    }
+  }
+  if (!touched) return DEFAULT_WEIGHTS
+  const total = Object.values(weights).reduce((sum, entry) => sum + entry, 0)
+  if (total === 0) return DEFAULT_WEIGHTS
+  // Normalise to 100 so a partial override cannot silently change the scale.
+  const scale = 100 / total
+  return {
+    coverage: weights.coverage * scale,
+    stack: weights.stack * scale,
+    experience: weights.experience * scale,
+    seniority: weights.seniority * scale,
+    location: weights.location * scale,
+  }
+}
+
+export interface RankableJob {
+  title: string
+  company: string
+  locations: NormalisedLocation[]
+  remote: RemoteMode
+  /** Skills already extracted from the posting at scrape time. */
+  skills: string[]
+  experience: ExperienceRange
+  descriptionText?: string | undefined
+  tags?: string[]
+}
+
 export interface RankingInput {
   roles: string[]
   locations: string[]
@@ -19,6 +96,7 @@ export interface RankingInput {
   skills: string[]
   maxYearsExperience: number
   minMatchScore: number
+  weights?: ScoreWeights
 }
 
 export interface RankingResult {
@@ -26,242 +104,310 @@ export interface RankingResult {
   decision: RankingDecision
   score: number
   matchedSkills: string[]
-  breakdown: {
-    title: number
-    seniority: number
-    skills: number
-    location: number
-    company: number
-  }
+  /** Required skills the candidate does not have. */
+  missingSkills: string[]
+  breakdown: ScoreWeights
   reasons: string[]
 }
 
-const SOFTWARE_ROLE_PATTERNS = [
-  /\bsoftware\b.*\b(?:engineer|developer)\b/i,
-  /\b(?:front[ -]?end|back[ -]?end|full[ -]?stack)\b.*\b(?:engineer|developer)\b/i,
-  /\b(?:engineer|developer)\b.*\b(?:front[ -]?end|back[ -]?end|full[ -]?stack)\b/i,
-  /\b(?:sde|software development engineer)\s*(?:i{1,4}|[1-4])?\b/i,
-  /\b(?:java|react|node(?:\.js)?|typescript|javascript)\s+(?:engineer|developer)\b/i,
-  /\bweb\s+(?:application\s+)?developer\b/i,
-]
+const SENIOR_PATTERN = /\b(?:senior|sr\.?|staff|principal|lead|iii|iv|3|4)\b/i
+const JUNIOR_PATTERN = /\b(?:junior|jr\.?|entry[\s-]?level|graduate|associate)\b|\b(?:engineer|developer|sde)\s*(?:i|1)\b/i
 
-const EXCLUDED_ROLE_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
-  { pattern: /\b(?:qa|quality assurance|quality engineer|test engineer|tester|testing|sdet)\b|\b(?:engineer|developer)\b.*\btest\b/i, label: 'testing or QA' },
-  { pattern: /\b(?:principal|staff|lead)\b/i, label: 'principal, staff, or lead seniority' },
-  { pattern: /\b(?:working student|intern|internship|trainee|apprentice|graduate engineer)\b/i, label: 'student or internship' },
-  { pattern: /\b(?:product manager|product owner|product analyst|project manager|program manager)\b/i, label: 'product or project management' },
-  { pattern: /\b(?:marketing|sales|account executive|account manager|business development)\b/i, label: 'marketing or sales' },
-  { pattern: /\b(?:customer success|customer support|technical support|support engineer)\b/i, label: 'customer support' },
-  { pattern: /\b(?:data scientist|data analyst|business analyst|financial analyst)\b/i, label: 'data or business analysis' },
-  { pattern: /\b(?:designer|recruiter|human resources|talent acquisition)\b/i, label: 'design or recruiting' },
-  { pattern: /\b(?:devops|site reliability|sre|cloud engineer|security engineer|network engineer)\b/i, label: 'infrastructure or security' },
-  { pattern: /\b(?:solutions? architect|enterprise architect|consultant|specialist)\b/i, label: 'architecture or specialist work' },
-  { pattern: /\b(?:android|ios|mobile|embedded|firmware)\s+(?:engineer|developer)\b/i, label: 'mobile or embedded development' },
-  { pattern: /\b(?:engineering manager|development manager|director of engineering|head of engineering)\b/i, label: 'engineering management' },
-]
-
-const JUNIOR_PATTERNS = [
-  /\b(?:junior|jr\.?|entry[ -]?level|graduate|intern|trainee|apprentice|working student)\b/i,
-  /\b(?:sde|software engineer|developer)\s*(?:i|1)\b/i,
-]
-
-const SENIOR_PATTERNS = [
-  /\b(?:senior|sr\.?)\b/i,
-  /\b(?:sde|software engineer|developer)\s*(?:iii|iv|3|4)\b/i,
-]
-
-const SKILL_ALIASES: Record<string, string[]> = {
-  react: ['react', 'react.js', 'reactjs'],
-  typescript: ['typescript'],
-  javascript: ['javascript', 'ecmascript'],
-  'node.js': ['node.js', 'nodejs', 'node js'],
-  java: ['java', 'spring boot', 'spring framework'],
-  postgresql: ['postgresql', 'postgres'],
-  aws: ['aws', 'amazon web services'],
-  docker: ['docker', 'containerization'],
-  graphql: ['graphql'],
-  redis: ['redis'],
-  'ci/cd': ['ci/cd', 'continuous integration', 'continuous delivery'],
-  python: ['python'],
-  kubernetes: ['kubernetes', 'k8s'],
+/**
+ * Families closest to a backend/full-stack engineer's day job. A mobile or
+ * data-engineering role is real software engineering and still a worse fit
+ * than another backend role, so it is scaled rather than dropped.
+ */
+const FAMILY_FIT: Record<SoftwareFamily, number> = {
+  backend: 1,
+  fullstack: 1,
+  generalist: 1,
+  frontend: 0.95,
+  platform: 0.9,
+  devops: 0.7,
+  'data-engineering': 0.7,
+  mobile: 0.6,
+  ml: 0.4,
+  qa: 0.4,
 }
 
-function emptyResult(decision: Exclude<RankingDecision, 'eligible' | 'below_threshold'>, reason: string): RankingResult {
+const CORE_CATEGORIES = new Set(['language', 'frontend', 'backend', 'database', 'cloud', 'devops'])
+
+const CANONICAL_BY_ALIAS = new Map<string, string>()
+for (const entry of SKILL_TAXONOMY) {
+  for (const alias of entry.aliases) CANONICAL_BY_ALIAS.set(alias.toLowerCase(), entry.name)
+  CANONICAL_BY_ALIAS.set(entry.name.toLowerCase(), entry.name)
+}
+
+const CATEGORY_BY_NAME = new Map(SKILL_TAXONOMY.map((entry) => [entry.name, entry.category]))
+
+function canonicalise(skill: string): string {
+  return CANONICAL_BY_ALIAS.get(skill.trim().toLowerCase()) ?? skill.trim()
+}
+
+function canonicalSet(skills: string[]): Set<string> {
+  return new Set(skills.map((skill) => canonicalise(skill)).filter(Boolean))
+}
+
+/**
+ * The skills a posting actually asks for.
+ *
+ * Preference order is requirements section, then the posting's extracted skill
+ * list. The cap matters: a JD that lists twenty five technologies is
+ * describing a whole department, and letting the denominator run away makes
+ * every such posting unmatchable regardless of fit.
+ */
+const MAX_REQUIRED = 12
+
+function isTechnical(skill: string): boolean {
+  const category = CATEGORY_BY_NAME.get(skill)
+  // Unknown names come from a source's own skill list, which is technical far
+  // more often than not; keeping them is the safer default.
+  return category === undefined || TECHNICAL_CATEGORIES.has(category)
+}
+
+export function requiredSkillsOf(job: RankableJob): string[] {
+  const text = job.descriptionText ?? ''
+  if (text) {
+    const sections = splitSections(text)
+    const fromRequirements = extractSkills({
+      title: job.title,
+      descriptionText: text,
+      sections,
+      tags: job.tags ?? [],
+      limit: 40,
+    })
+      .filter((skill) => skill.source === 'requirements' || skill.source === 'title' || skill.source === 'tags')
+      .map((skill) => skill.name)
+      .filter(isTechnical)
+    if (fromRequirements.length >= 3) return fromRequirements.slice(0, MAX_REQUIRED)
+  }
+  return job.skills.map((skill) => canonicalise(skill)).filter(isTechnical).slice(0, MAX_REQUIRED)
+}
+
+/**
+ * Expands a profile with the umbrella skills its concrete tools demonstrate,
+ * so a posting asking for "Monitoring" is not counted against someone who runs
+ * Grafana and Prometheus.
+ */
+function withImpliedSkills(profile: Set<string>): Set<string> {
+  const expanded = new Set(profile)
+  for (const [umbrella, evidence] of Object.entries(IMPLIED_BY)) {
+    if (!expanded.has(umbrella) && evidence.some((skill) => profile.has(skill))) {
+      expanded.add(umbrella)
+    }
+  }
+  return expanded
+}
+
+interface Component {
+  ratio: number
+  reason: string
+  weak: boolean
+}
+
+function scoreCoverage(required: string[], profile: Set<string>): Component & {
+  matched: string[]
+  missing: string[]
+} {
+  if (required.length === 0) {
+    return {
+      ratio: 0.5,
+      reason: 'The posting does not list any recognisable skills',
+      weak: false,
+      matched: [],
+      missing: [],
+    }
+  }
+  const matched = required.filter((skill) => profile.has(skill))
+  const missing = required.filter((skill) => !profile.has(skill))
+  const ratio = matched.length / required.length
   return {
-    accepted: false,
-    decision,
-    score: 0,
-    matchedSkills: [],
-    breakdown: { title: 0, seniority: 0, skills: 0, location: 0, company: 0 },
-    reasons: [reason],
+    ratio,
+    reason: `You have ${matched.length} of the ${required.length} skills asked for${missing.length > 0 ? `; missing ${missing.slice(0, 5).join(', ')}` : ''}`,
+    weak: ratio < 0.5,
+    matched,
+    missing,
   }
 }
 
-function overlap(left: string[], right: string[]): number {
-  if (left.length === 0 || right.length === 0) return 0
-  const rightSet = new Set(right.map((value) => value.toLowerCase()))
-  return left.filter((value) => rightSet.has(value.toLowerCase())).length
+function scoreStack(job: RankableJob, profileCore: Set<string>): Component {
+  const jobSkills = canonicalSet(job.skills)
+  const shared = [...jobSkills].filter((skill) => profileCore.has(skill))
+  // Five shared core technologies is a full mark: past that the posting is not
+  // meaningfully more familiar, it is just longer.
+  const ratio = Math.min(1, shared.length / 5)
+  return {
+    ratio,
+    reason:
+      shared.length > 0
+        ? `Built on your stack: ${shared.slice(0, 6).join(', ')}`
+        : 'None of your core technologies appear in this posting',
+    weak: shared.length === 0,
+  }
 }
 
-function locationScore(job: ScrapedJob, wanted: string[]): { matched: boolean; score: number; reason: string } {
-  if (wanted.length === 0) return { matched: true, score: 15, reason: 'No location restriction' }
+function scoreExperience(job: RankableJob, maxYears: number): Component {
+  const required = job.experience.min
+  if (required === null) {
+    return { ratio: 0.7, reason: 'Years of experience not stated', weak: false }
+  }
+  if (required <= maxYears) {
+    return { ratio: 1, reason: `Asks for ${required}+ years; within your ${maxYears}`, weak: false }
+  }
+  const over = required - maxYears
+  if (over <= 1) return { ratio: 0.7, reason: `Asks for ${required} years, one above your ${maxYears}`, weak: false }
+  if (over <= 3) return { ratio: 0.3, reason: `Asks for ${required} years, ${over} above your ${maxYears}`, weak: true }
+  return { ratio: 0, reason: `Asks for ${required} years, far above your ${maxYears}`, weak: true }
+}
+
+function scoreSeniority(title: string, roles: string[]): Component {
+  const wantsSenior = roles.some((role) => /\b(?:senior|sr\.?|staff|principal|lead)\b/i.test(role))
+  const isJunior = JUNIOR_PATTERN.test(title)
+  const isSenior = SENIOR_PATTERN.test(title)
+
+  if (isJunior && wantsSenior) {
+    return { ratio: 0.2, reason: 'Junior or associate level', weak: true }
+  }
+  if (wantsSenior && !isSenior) {
+    return { ratio: 0.7, reason: 'Title does not state a seniority', weak: false }
+  }
+  return { ratio: 1, reason: isSenior ? 'Senior level matched' : 'Seniority matches', weak: false }
+}
+
+function scoreLocation(job: RankableJob, wanted: string[]): Component {
+  if (wanted.length === 0) return { ratio: 1, reason: 'No location restriction', weak: false }
+
   const wantedText = wanted.join(' ').toLowerCase()
   const raw = job.locations.map((location) => location.raw).join(' ').toLowerCase()
   const wantedTokens = keywordTokens(wantedText).filter((token) => token !== 'remote')
   const locationTokens = keywordTokens(raw)
-  if (overlap(wantedTokens, locationTokens) > 0) {
-    return { matched: true, score: 15, reason: 'Preferred location matches' }
+  if (wantedTokens.some((token) => locationTokens.includes(token))) {
+    return { ratio: 1, reason: 'Preferred location matches', weak: false }
   }
 
-  if (job.remote === 'remote' && wantedText.includes('remote')) {
-    const explicitlyGlobal = /\b(anywhere|worldwide|global|any country)\b/i.test(raw)
-    const countryRestricted = job.locations.some(
-      (location: NormalisedLocation) => Boolean(location.countryCode),
-    )
-    if (explicitlyGlobal || !countryRestricted) {
-      return { matched: true, score: 15, reason: 'Worldwide remote role' }
+  if (job.remote === 'remote') {
+    const worldwide = /\b(anywhere|worldwide|global|any country)\b/i.test(raw) || raw.trim() === ''
+    const countryRestricted = job.locations.some((location) => Boolean(location.countryCode))
+    if (worldwide || !countryRestricted) {
+      return { ratio: 1, reason: 'Worldwide remote role', weak: false }
     }
-    return { matched: false, score: 0, reason: 'Remote role is restricted to another country' }
+    return { ratio: 0.2, reason: 'Remote, but restricted to another country', weak: true }
   }
-  return { matched: false, score: 0, reason: 'Location does not match preferences' }
+  if (job.remote === 'hybrid') {
+    return { ratio: 0.15, reason: 'Hybrid, outside your locations', weak: true }
+  }
+  return { ratio: 0.05, reason: 'On-site outside your locations', weak: true }
 }
 
-function matchesSoftwareRole(title: string): boolean {
-  return SOFTWARE_ROLE_PATTERNS.some((pattern) => pattern.test(title))
-}
+export function rankJob(job: RankableJob, input: RankingInput): RankingResult {
+  const weights = input.weights ?? DEFAULT_WEIGHTS
+  const empty: ScoreWeights = { coverage: 0, stack: 0, experience: 0, seniority: 0, location: 0 }
 
-function matchProfileSkills(job: ScrapedJob, profileSkills: string[]): string[] {
-  const text = `${job.title} ${job.descriptionText ?? ''} ${job.tags.join(' ')}`.toLowerCase()
-  const matches: string[] = []
-  for (const skill of [...new Set(profileSkills)]) {
-    const key = skill.toLowerCase()
-    const aliases = SKILL_ALIASES[key] ?? [key]
-    if (aliases.some((alias) => {
-      const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i').test(text)
-    })) matches.push(skill)
-  }
-  return matches
-}
-
-export function extractRequiredExperienceYears(text: string): number | null {
-  const rangePattern = /\b(\d{1,2})\s*(?:[-–—]|to)\s*\d{1,2}\s*(?:years?|yrs?)\s+(?:of\s+)?(?:relevant\s+|professional\s+|work\s+|hands-on\s+)?experience\b/gi
-  const requirements: number[] = []
-  for (const match of text.matchAll(rangePattern)) {
-    const years = Number(match[1])
-    if (Number.isInteger(years) && years >= 0 && years <= 50) requirements.push(years)
-  }
-
-  const withoutRanges = text.replace(rangePattern, ' ')
-  const patterns = [
-    /\b(?:minimum(?:\s+of)?|at\s+least)?\s*(\d{1,2})\+?\s*(?:years?|yrs?)\s+(?:of\s+)?(?:relevant\s+|professional\s+|work\s+|hands-on\s+|software\s+engineering\s+)?experience\b/gi,
-    /\bexperience\s*(?:of|:)?\s*(?:at\s+least\s*)?(\d{1,2})\+?\s*(?:years?|yrs?)\b/gi,
-    /\b(\d{1,2})\+?\s*(?:years?|yrs?)\s+(?:building|developing|working\s+with|in\s+software\s+development|in\s+software\s+engineering)\b/gi,
-  ]
-  for (const pattern of patterns) {
-    for (const match of withoutRanges.matchAll(pattern)) {
-      const years = Number(match[1])
-      if (Number.isInteger(years) && years >= 0 && years <= 50) requirements.push(years)
+  const verdict = classifyRole(job.title)
+  if (verdict.kind === 'rejected') {
+    return {
+      accepted: false,
+      decision: 'role_mismatch',
+      score: 0,
+      matchedSkills: [],
+      missingSkills: [],
+      breakdown: empty,
+      reasons: [`Not a software engineering role: ${verdict.reason}`],
     }
   }
-  return requirements.length > 0 ? Math.max(...requirements) : null
-}
 
-export function rankJob(job: ScrapedJob, input: RankingInput): RankingResult {
   const haystack = `${job.title} ${job.company} ${job.descriptionText ?? ''}`.toLowerCase()
-  const blocker = input.dealBreakers.find((value) => haystack.includes(value.toLowerCase()))
-  if (blocker) return emptyResult('deal_breaker', `Deal breaker matched: ${blocker}`)
-
-  const excludedRole = EXCLUDED_ROLE_PATTERNS.find(({ pattern }) => pattern.test(job.title))
-  if (excludedRole) {
-    return emptyResult('role_mismatch', `Excluded role family: ${excludedRole.label}`)
-  }
-  if (!matchesSoftwareRole(job.title)) {
-    return emptyResult('role_mismatch', 'Title is not software, frontend, backend, or full-stack engineering')
-  }
-
-  const wantsSenior = input.roles.some((role) => /\b(?:senior|sr\.?)\b/i.test(role))
-  const matchedSkills = matchProfileSkills(job, input.skills)
-  const location = locationScore(job, input.locations)
-  const title = 35
-  const company = input.dreamCompanies.some(
-    (value) => value.toLowerCase() === job.company.toLowerCase(),
-  ) ? 5 : 0
-  const partialSkills = Math.min(30, matchedSkills.length * 5)
-
-  if (wantsSenior && JUNIOR_PATTERNS.some((pattern) => pattern.test(job.title))) {
+  const blocker = input.dealBreakers
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .find((value) => haystack.includes(value.toLowerCase()))
+  if (blocker) {
     return {
       accepted: false,
-      decision: 'seniority_mismatch',
-      score: Math.min(100, title + partialSkills + (location.matched ? location.score : 0) + company),
-      matchedSkills,
-      breakdown: { title, seniority: 0, skills: partialSkills, location: location.matched ? location.score : 0, company },
-      reasons: ['Junior, student, or internship seniority is excluded'],
-    }
-  }
-  if (wantsSenior && !SENIOR_PATTERNS.some((pattern) => pattern.test(job.title))) {
-    return {
-      accepted: false,
-      decision: 'seniority_mismatch',
-      score: Math.min(100, title + partialSkills + (location.matched ? location.score : 0) + company),
-      matchedSkills,
-      breakdown: { title, seniority: 0, skills: partialSkills, location: location.matched ? location.score : 0, company },
-      reasons: ['Title does not indicate senior-level responsibility'],
-    }
-  }
-  const requiredExperienceYears = extractRequiredExperienceYears(`${job.title} ${job.descriptionText ?? ''}`)
-  if (requiredExperienceYears !== null && requiredExperienceYears > input.maxYearsExperience) {
-    const seniority = wantsSenior ? 15 : 10
-    return {
-      accepted: false,
-      decision: 'experience_mismatch',
-      score: Math.min(100, title + seniority + partialSkills + (location.matched ? location.score : 0) + company),
-      matchedSkills,
-      breakdown: { title, seniority, skills: partialSkills, location: location.matched ? location.score : 0, company },
-      reasons: [`Requires ${requiredExperienceYears} years; your maximum is ${input.maxYearsExperience}`],
+      decision: 'deal_breaker',
+      score: 0,
+      matchedSkills: [],
+      missingSkills: [],
+      breakdown: empty,
+      reasons: [`Deal breaker matched: "${blocker}"`],
     }
   }
 
-  const seniority = wantsSenior ? 15 : 10
-  const minimumSkillMatches = Math.min(3, input.skills.length)
-  if (matchedSkills.length < minimumSkillMatches) {
-    return {
-      accepted: false,
-      decision: 'insufficient_skills',
-      score: Math.min(100, title + seniority + partialSkills + (location.matched ? location.score : 0) + company),
-      matchedSkills,
-      breakdown: { title, seniority, skills: partialSkills, location: location.matched ? location.score : 0, company },
-      reasons: [`Only ${matchedSkills.length} confirmed skills matched; ${minimumSkillMatches} required`],
-    }
-  }
+  const profile = withImpliedSkills(canonicalSet(input.skills))
+  const profileCore = new Set(
+    [...profile].filter((skill) => {
+      const category = CATEGORY_BY_NAME.get(skill)
+      return category !== undefined && CORE_CATEGORIES.has(category)
+    }),
+  )
 
-  const skills = Math.min(35, 15 + matchedSkills.length * 5)
-  if (!location.matched) {
-    return {
-      accepted: false,
-      decision: 'location_mismatch',
-      score: Math.min(100, title + seniority + skills + company),
-      matchedSkills,
-      breakdown: { title, seniority, skills, location: 0, company },
-      reasons: [location.reason, `${matchedSkills.length} confirmed skills matched: ${matchedSkills.join(', ')}`],
-    }
-  }
+  const required = requiredSkillsOf(job)
+  const coverage = scoreCoverage(required, profile)
+  const stack = scoreStack(job, profileCore.size > 0 ? profileCore : profile)
+  const experience = scoreExperience(job, input.maxYearsExperience)
+  const seniority = scoreSeniority(job.title, input.roles)
+  const location = scoreLocation(job, input.locations)
+  const familyFit = FAMILY_FIT[verdict.family]
 
-  const score = Math.min(100, title + seniority + skills + location.score + company)
+  const breakdown: ScoreWeights = {
+    // Family fit scales the two skill components rather than being its own
+    // slice: a mobile role is not "missing points", it is a weaker version of
+    // the same match.
+    coverage: Math.round(coverage.ratio * familyFit * weights.coverage),
+    stack: Math.round(stack.ratio * familyFit * weights.stack),
+    experience: Math.round(experience.ratio * weights.experience),
+    seniority: Math.round(seniority.ratio * weights.seniority),
+    location: Math.round(location.ratio * weights.location),
+  }
+  const raw = Object.values(breakdown).reduce((sum, value) => sum + value, 0)
+  // A job in the wrong place is not a slightly worse job — it is one that
+  // cannot be taken. Losing fifteen points still left country-restricted
+  // remote roles in the eighties, so a bad location caps the total instead.
+  const LOCATION_CAP = 70
+  const capped = location.ratio <= 0.2 ? Math.min(raw, LOCATION_CAP) : raw
+  const score = Math.max(0, Math.min(100, capped))
+
   const reasons = [
-    'Software engineering title matched',
-    wantsSenior ? 'Senior-level title matched' : 'Requested seniority matched',
-    `${matchedSkills.length} confirmed skills matched: ${matchedSkills.join(', ')}`,
+    `${verdict.family === 'generalist' ? 'Software engineering' : verdict.family} role`,
+    coverage.reason,
+    stack.reason,
+    experience.reason,
+    seniority.reason,
     location.reason,
-    ...(company > 0 ? ['Preferred company'] : []),
   ]
+
+  if (score >= input.minMatchScore) {
+    return {
+      accepted: true,
+      decision: 'eligible',
+      score,
+      matchedSkills: coverage.matched,
+      missingSkills: coverage.missing,
+      breakdown,
+      reasons,
+    }
+  }
+
+  const weakest: Array<[RankingDecision, Component, number]> = [
+    ['insufficient_skills', coverage, weights.coverage],
+    ['insufficient_skills', stack, weights.stack],
+    ['experience_mismatch', experience, weights.experience],
+    ['seniority_mismatch', seniority, weights.seniority],
+    ['location_mismatch', location, weights.location],
+  ]
+  const worst = weakest
+    .filter(([, component]) => component.weak)
+    .sort((left, right) => (1 - left[1].ratio) * left[2] - (1 - right[1].ratio) * right[2])
+    .at(-1)
 
   return {
-    accepted: score >= input.minMatchScore,
-    decision: score >= input.minMatchScore ? 'eligible' : 'below_threshold',
+    accepted: false,
+    decision: worst?.[0] ?? 'below_threshold',
     score,
-    matchedSkills,
-    breakdown: { title, seniority, skills, location: location.score, company },
-    reasons,
+    matchedSkills: coverage.matched,
+    missingSkills: coverage.missing,
+    breakdown,
+    reasons: [`Scored ${score}, below your minimum of ${input.minMatchScore}`, ...reasons],
   }
 }

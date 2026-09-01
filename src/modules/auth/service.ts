@@ -40,30 +40,29 @@ export function avatarFor(email: string): string {
 }
 
 async function issueSession(user: User, context: RequestContext): Promise<AuthSession> {
-  const [tokenRow] = await db
-    .insert(refreshTokens)
-    .values({
+  // The id is generated here rather than by the database, which breaks the
+  // chicken-and-egg the previous version worked around with an insert followed
+  // by an update: the token needs the row id, and the row needs the token's
+  // hash. Deciding the id up front makes it a single insert, and the row is
+  // never briefly stored with a placeholder hash.
+  const tokenId = crypto.randomUUID()
+  const refreshToken = signRefreshToken({ userId: user.id, tokenId })
+
+  const [insert, dto] = await Promise.all([
+    db.insert(refreshTokens).values({
+      id: tokenId,
       userId: user.id,
-      // Placeholder: the real hash needs the token, and the token needs this
-      // row's id. Written back immediately below, inside the same request.
-      tokenHash: `pending:${crypto.randomUUID()}`,
+      tokenHash: hashToken(refreshToken),
       expiresAt: expiryFromDuration(env.JWT_REFRESH_TTL),
       userAgent: context.userAgent ?? null,
       ipAddress: context.ipAddress ?? null,
-    })
-    .returning({ id: refreshTokens.id })
-
-  if (!tokenRow) throw new Error('Could not create a refresh token row')
-
-  const refreshToken = signRefreshToken({ userId: user.id, tokenId: tokenRow.id })
-
-  await db
-    .update(refreshTokens)
-    .set({ tokenHash: hashToken(refreshToken) })
-    .where(eq(refreshTokens.id, tokenRow.id))
+    }),
+    serializeUserWithKit(user),
+  ])
+  void insert
 
   return {
-    user: await serializeUserWithKit(user),
+    user: dto,
     accessToken: signAccessToken({ userId: user.id, email: user.email }),
     refreshToken,
     expiresIn: accessTokenExpiresInSeconds(),
@@ -129,10 +128,15 @@ export async function signIn(input: SignInInput, context: RequestContext): Promi
   const valid = await verifyPassword(input.password, user.passwordHash)
   if (!valid) throw unauthorized('Email or password is wrong.')
 
-  await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id))
+  // The login stamp is bookkeeping; the caller should not wait a round trip
+  // for it. It still runs inside this request, just alongside the session.
+  const [session] = await Promise.all([
+    issueSession(user, context),
+    db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id)),
+  ])
 
   logger.info({ userId: user.id }, 'signed in')
-  return issueSession(user, context)
+  return session
 }
 
 /**
