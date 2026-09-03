@@ -22,7 +22,20 @@ export interface Recipe {
   openForm?: (page: Page) => Promise<void>
   /** Selector for the field containers, so labels pair with inputs correctly. */
   fieldContainer: string
-  /** The control that submits. Never clicked in dry-run mode. */
+  /**
+   * The control that submits. Never clicked in dry-run mode.
+   *
+   * Match on the button's *words*, never on `type="submit"`. Every one of
+   * these platforms puts several submit-typed buttons on the form — Ashby's
+   * application page has eight, including "Upload file" and a pair of
+   * Yes/No answers, and Lever's only submit-typed buttons belong to the
+   * cookie banner. A generic selector plus `.first()` clicks whichever comes
+   * first in the DOM, which is not the one that sends the application.
+   *
+   * `:has-text()` rather than `:text-matches()`: the latter matches only the
+   * smallest element holding the text, so it missed Ashby's button, which
+   * wraps its label in a span.
+   */
   submit: string
   /** Text that means it worked. */
   success: RegExp
@@ -164,7 +177,8 @@ const greenhouse: Recipe = {
   id: 'greenhouse',
   matches: (host) => host.includes('greenhouse.io') || host.includes('boards.greenhouse.io'),
   fieldContainer: '#application_form, form#application-form, form',
-  submit: '#submit_app, input[type="submit"], button[type="submit"]',
+  // Greenhouse's own id first; the generic fallbacks are last on purpose.
+  submit: '#submit_app, button:has-text("Submit Application")',
   success: /thank you|application (?:was )?submitted|received your application/i,
 }
 
@@ -180,7 +194,12 @@ const lever: Recipe = {
     }
   },
   fieldContainer: '.application-form, form[action*="apply"], form',
-  submit: 'button[type="submit"], .postings-btn[type="submit"]',
+  // Matched on the button's words, not its type. Lever's real submit is a
+  // `button[type="button"]` reading "Submit application", while the page's
+  // only `button[type="submit"]` elements belong to the cookie banner — so
+  // the old selector would have clicked Accept or Deny and reported a failed
+  // submission, having pressed something nobody asked it to press.
+  submit: 'button:has-text("Submit Application"), .postings-btn:has-text("Submit")',
   success: /thank you|application (?:was )?submitted|we have received/i,
 }
 
@@ -216,7 +235,7 @@ const ashby: Recipe = {
       .catch(() => undefined)
   },
   fieldContainer: 'form',
-  submit: 'button[type="submit"]',
+  submit: 'button:has-text("Submit Application")',
   success: /thank you|submitted|received/i,
 }
 

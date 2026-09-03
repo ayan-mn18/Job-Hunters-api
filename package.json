@@ -23,7 +23,8 @@
     "linkedin:import": "tsx src/scripts/import-linkedin-dms.ts",
     "runner": "node dist/runner.js",
     "runner:dev": "tsx watch src/runner.ts",
-    "queue:smoke": "tsx src/scripts/queue-smoke.ts"
+    "queue:smoke": "tsx src/scripts/queue-smoke.ts",
+    "apply:dry-run": "tsx src/scripts/dry-run.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.122.0",

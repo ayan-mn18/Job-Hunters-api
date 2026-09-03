@@ -105,10 +105,27 @@ export function sensitiveReason(label: string, options?: string[]): string | nul
   return null
 }
 
+/**
+ * Strips the decoration forms put around a label.
+ *
+ * Required markers are not always an asterisk: Lever renders a heavy asterisk
+ * (U+2731), others use a dagger or the word itself. Matching the raw label
+ * meant an anchored pattern like /^(?:full\s*)?name$/ failed on "Full name✱",
+ * so a Lever application could not fill the candidate's own name.
+ */
+export function normaliseLabel(label: string): string {
+  return label
+    .replace(/[\u2731\u066D\uFF0A*†‡]/g, '')
+    .replace(/\((?:required|optional)\)/gi, '')
+    .replace(/\s+/g, ' ')
+    .replace(/[:\s]+$/, '')
+    .trim()
+}
+
 /** Stable across cosmetic label changes, distinct across real ones. */
 export function fieldSignature(field: FormField): string {
   const canonical = [
-    field.label.trim().toLowerCase().replace(/\s+/g, ' ').replace(/[*:]\s*$/, ''),
+    normaliseLabel(field.label).toLowerCase(),
     field.type.toLowerCase(),
     (field.name ?? '').toLowerCase(),
   ].join('|')
@@ -179,8 +196,9 @@ const HEURISTIC_LABEL_LIMIT = 80
 
 export function heuristicMatch(field: FormField): string | null {
   if (field.label.length > HEURISTIC_LABEL_LIMIT) return null
+  const label = normaliseLabel(field.label)
   for (const [pattern, key] of HEURISTICS) {
-    if (pattern.test(field.label)) return String(key)
+    if (pattern.test(label)) return String(key)
   }
   return null
 }

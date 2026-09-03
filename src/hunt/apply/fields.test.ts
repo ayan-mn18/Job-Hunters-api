@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { fieldSignature, heuristicMatch, sensitiveReason, valueFromProfile } from './fields.js'
+import { fieldSignature, heuristicMatch, sensitiveReason, valueFromProfile, normaliseLabel } from './fields.js'
 import type { PortalProfile } from '../portal-profile.js'
 
 const profile = {
@@ -157,5 +157,24 @@ describe('heuristic mapping', () => {
     // An empty string is not an answer.
     assert.equal(valueFromProfile('portfolio', profile), null)
     assert.equal(valueFromProfile('nonsense', profile), null)
+  })
+})
+
+describe('label normalisation', () => {
+  it('strips the required markers forms actually use', () => {
+    // Lever renders a heavy asterisk, not the ASCII one. Matching the raw
+    // label meant an anchored pattern failed on the candidate's own name.
+    assert.equal(normaliseLabel('Full name✱'), 'Full name')
+    assert.equal(normaliseLabel('First Name*'), 'First Name')
+    assert.equal(normaliseLabel('Email:'), 'Email')
+    assert.equal(normaliseLabel('Phone (required)'), 'Phone')
+  })
+
+  it('collapses whitespace without changing the words', () => {
+    assert.equal(normaliseLabel('  Current   company  '), 'Current company')
+  })
+
+  it('leaves an ordinary label alone', () => {
+    assert.equal(normaliseLabel('LinkedIn URL'), 'LinkedIn URL')
   })
 })

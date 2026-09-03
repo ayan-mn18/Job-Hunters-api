@@ -3,7 +3,7 @@ import { env } from '../../config/env.js'
 import { logger } from '../../lib/logger.js'
 import type { PortalProfile } from '../portal-profile.js'
 import { publishAttemptEvent } from './events.js'
-import { resolveField, type FormField, type Rung } from './fields.js'
+import { normaliseLabel, resolveField, type FormField, type Rung } from './fields.js'
 import { GENERIC, readFields, recipeFor, type Recipe } from './recipes.js'
 import type { BlockedReason } from './state.js'
 
@@ -28,12 +28,30 @@ export interface FillResult {
   recipe: string
 }
 
+/**
+ * Escapes a value for use inside an attribute selector.
+ *
+ * `CSS.escape` lives here in Node, not the browser, so calling it threw
+ * "CSS is not defined" and broke every Lever application outright — the
+ * platform whose forms name their controls rather than labelling them.
+ * Only the quote and the backslash can break out of `[name="..."]`.
+ */
+function escapeAttributeValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
 /** Locates a control by its label, the way the reader paired them. */
 function controlFor(page: Page, field: FormField) {
-  const escaped = field.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').slice(0, 60)
+  // Match on the normalised label, not the raw one. The DOM label carries the
+  // required marker ("First Name*") because it comes from a sibling span, but
+  // the *accessible* name usually does not — so a regex built from the raw
+  // text matched nothing and the candidate's own name went unfilled.
+  const escaped = normaliseLabel(field.label)
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .slice(0, 60)
   const byLabel = page.getByLabel(new RegExp(escaped, 'i')).first()
   if (field.name) {
-    return byLabel.or(page.locator(`[name="${CSS.escape(field.name)}"]`).first())
+    return byLabel.or(page.locator(`[name="${escapeAttributeValue(field.name)}"]`).first())
   }
   return byLabel
 }
@@ -154,10 +172,32 @@ export async function fillForm(params: {
   return { fields: filled, unresolved, recipe: plan.id }
 }
 
+/**
+ * A posting that has been taken down since it was scraped.
+ *
+ * Found by the first live dry run: a stored Ashby job answered with "Job not
+ * found", the runtime reported `no_submit_control`, and the user would have
+ * seen a confusing failure. It is not a failure — the job is simply gone, and
+ * it should cost neither a slot in the daily budget nor a place in the review
+ * queue.
+ */
+const POSTING_GONE =
+  /\bjob\s+not\s+found\b|\bposition\s+(?:is\s+)?(?:no\s+longer|has\s+been)\s+(?:available|filled|closed)\b|\bno\s+longer\s+accepting\s+applications\b|\bthis\s+job\s+(?:posting\s+)?(?:is\s+)?(?:closed|expired)\b|\bposting\s+(?:is\s+)?closed\b/i
+
+/** True when the page says the posting is gone rather than showing a form. */
+export async function postingIsClosed(page: Page): Promise<boolean> {
+  const body = await page.locator('body').innerText().catch(() => '')
+  // Only trust it on a page with no form at all: a live posting can mention
+  // "no longer accepting applications" about some *other* role in a sidebar.
+  if (!POSTING_GONE.test(body)) return false
+  const inputs = await page.locator('input:not([type="hidden"]), textarea, select').count().catch(() => 0)
+  return inputs === 0
+}
+
 export interface SubmitResult {
   submitted: boolean
   /** Set when we deliberately did not submit. */
-  heldBack?: 'dry_run' | 'kill_switch' | 'no_submit_control'
+  heldBack?: 'dry_run' | 'kill_switch' | 'no_submit_control' | 'posting_closed'
   confirmation?: string
 }
 
@@ -178,6 +218,10 @@ export async function submitForm(params: {
   const plan = recipe ?? { ...GENERIC, id: 'generic', matches: () => true }
 
   if (env.APPLY_KILL_SWITCH) return { submitted: false, heldBack: 'kill_switch' }
+
+  // Checked before looking for a submit control, so a dead posting reads as
+  // "this job is gone" rather than "we could not find the button".
+  if (await postingIsClosed(page)) return { submitted: false, heldBack: 'posting_closed' }
 
   const submit = page.locator(plan.submit).first()
   if ((await submit.count()) === 0 || !(await submit.isVisible().catch(() => false))) {
