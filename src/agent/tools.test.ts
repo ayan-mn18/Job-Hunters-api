@@ -184,3 +184,22 @@ describe('agent tools', () => {
     assert.equal(result.finished?.submitted, false)
   })
 })
+
+/**
+ * The dry-run guard has to hold at the point of the click, not at the point
+ * some other process decided this run was live. A live run reaching a runner
+ * configured for dry runs must stay dry.
+ */
+describe('submit guard', () => {
+  it('refuses to submit when the run itself is a dry run', async () => {
+    const { page, calls } = stubPage()
+    const context = contextWith(
+      [element({ ref: 1, kind: 'button', label: 'Submit application', submits: true })],
+      true,
+      page,
+    )
+    const result = await runTool(context, 'submit', { ref: 1 })
+    assert.equal(result.ok, false)
+    assert.equal(calls.clicked.length, 0)
+  })
+})

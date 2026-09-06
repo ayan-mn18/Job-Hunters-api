@@ -208,13 +208,32 @@ async function teardown(state: Teardown, runId: string): Promise<void> {
  */
 async function finishApplication(
   ref: { id: string; userId: string },
-  run: { id: string; userId: string; dryRun: boolean; prompt: string },
+  storedRun: { id: string; userId: string; dryRun: boolean; prompt: string },
   chosen: ShortlistEntry,
   job: ScrapedJob | null,
   profile: Awaited<ReturnType<typeof loadPortalProfile>>,
   state: Teardown,
   skill: SiteSkill | null,
 ): Promise<void> {
+  /**
+   * The safer of what the run was created with and what this process is set to.
+   *
+   * `dryRun` is decided by the API when the row is written, and the runner is
+   * what actually clicks submit. Those are separate processes with separate
+   * environments, and a live run reaching a runner configured for dry runs must
+   * stay dry — never the other way round.
+   */
+  const run = { ...storedRun, dryRun: storedRun.dryRun || env.APPLY_DRY_RUN }
+
+  if (env.APPLY_KILL_SWITCH) {
+    await say(ref, 'huntly', 'Applications are switched off right now. Nothing was sent.')
+    await setState(ref, { status: 'cancelled', completedAt: new Date() })
+    return
+  }
+  if (run.dryRun !== storedRun.dryRun) {
+    await say(ref, 'huntly', 'Running as a dry run: this server has submitting switched off.')
+    await setState(ref, { dryRun: true })
+  }
     await setState(ref, {
     status: 'applying',
     chosenJobUrl: chosen.url,

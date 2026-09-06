@@ -1,4 +1,5 @@
 import type { Page } from 'playwright-core'
+import { env } from '../config/env.js'
 import { logger } from '../lib/logger.js'
 import { sensitiveReason } from '../hunt/apply/fields.js'
 import { normaliseHttpUrl } from '../hunt/apply/urls.js'
@@ -344,8 +345,16 @@ export async function runTool(
       return { ok: true, message: 'Taking a picture of the page.' }
 
     case 'submit': {
-      if (context.dryRun) {
+      // Checked here, immediately before the click, rather than trusted from
+      // whatever decided this run was live. The process that presses the
+      // button is the one whose safety settings have to hold — an API replica
+      // configured differently from the runner must not be able to talk it
+      // into sending an application.
+      if (context.dryRun || env.APPLY_DRY_RUN) {
         return { ok: false, message: 'This is a dry run. Nothing is submitted. Call done instead.' }
+      }
+      if (env.APPLY_KILL_SWITCH) {
+        return { ok: false, message: 'Applications are switched off right now. Call done instead.' }
       }
       const element = elementFor(context, args.ref)
       if (!element) return { ok: false, message: `No element numbered ${String(args.ref)}.` }
