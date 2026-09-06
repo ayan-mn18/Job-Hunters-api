@@ -1,36 +1,35 @@
 import { logger } from '../lib/logger.js'
 
 /**
- * ============================ STUBBED WORKSTREAM ============================
- * Scraping, scoring, resume tailoring and form-filling are a BullMQ worker
- * owned by another agent. This API never runs that work — it only records a
- * `hunt_runs` row and hands the id over.
+ * The seam between "a run was requested" and "a run is executing".
  *
- * The contract is one-directional and deliberately thin:
- *   API  → queue:  "run <runId> for user <userId>, target N applications"
- *   API  → queue:  "stop <runId>"
- *   worker → DB:   updates hunt_runs.progress / status, inserts applications
- *                  and activity_events
+ * The API records a `hunt_runs` row and hands the id over; the worker owns
+ * every write after that. Keeping the direction one-way — worker writes to the
+ * database rather than calling back into HTTP — means a long scrape does not
+ * depend on the web process staying up.
  *
- * The worker owning the writes (rather than calling back into HTTP) means a
- * long run does not depend on this process staying up.
- *
- * TODO(worker-workstream): register a BullMQ-backed implementation via
- * `setHuntQueue()` at boot. See docs/.
- * ===========================================================================
+ * The real implementation lives in `queues/discover.ts` and is registered at
+ * boot by `registerQueueImplementations()`. When Redis is absent the stub
+ * below stays in place and says so, which is the honest failure: the run row
+ * exists and nothing will execute it.
  */
 
 export interface HuntJobRequest {
   runId: string
   userId: string
   targetApplications: number
-  minMatchScore: number
-  roles: string[]
-  locations: string[]
-  dreamCompanies: string[]
-  dealBreakers: string[]
-  portalIds: string[]
-  baseResumeId: string | null
+  /**
+   * Descriptive fields, all optional. The worker re-reads the spec, kit and
+   * resume from the database rather than trusting a snapshot taken at enqueue
+   * time — by the time a job runs, the user may have edited any of them.
+   */
+  minMatchScore?: number
+  roles?: string[]
+  locations?: string[]
+  dreamCompanies?: string[]
+  dealBreakers?: string[]
+  portalIds?: string[]
+  baseResumeId?: string | null
 }
 
 export interface HuntQueue {

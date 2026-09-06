@@ -5,13 +5,18 @@ import { env, isProduction } from './config/env.js'
 import { forbidden } from './lib/errors.js'
 import { errorHandler, notFoundHandler } from './middleware/error.js'
 import { globalLimiter } from './middleware/rateLimit.js'
-import { httpLogger, requestId } from './middleware/requestId.js'
+import { httpLogger, requestId, responseTime } from './middleware/requestId.js'
 import { applicationsRouter } from './modules/applications/routes.js'
 import { authRouter } from './modules/auth/routes.js'
+import { billingRouter } from './modules/billing/routes.js'
 import { dashboardRouter } from './modules/dashboard/routes.js'
 import { healthRouter } from './modules/health/routes.js'
 import { huntRouter } from './modules/hunt/routes.js'
+import { intakeRouter } from './modules/intake/routes.js'
 import { meRouter } from './modules/me/routes.js'
+import { notificationsRouter } from './modules/notifications/routes.js'
+import { inboxRouter } from './modules/inbox/routes.js'
+import { outreachRouter } from './modules/outreach/routes.js'
 import { portalsRouter } from './modules/portals/routes.js'
 import { portalAccountsRouter } from './modules/portal-accounts/routes.js'
 import { referralsRouter } from './modules/referrals/routes.js'
@@ -28,6 +33,7 @@ export function createApp(): Express {
   app.disable('x-powered-by')
 
   app.use(requestId)
+  app.use(responseTime)
   app.use(httpLogger)
 
   app.use(
@@ -59,11 +65,14 @@ export function createApp(): Express {
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
       allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id'],
-      exposedHeaders: ['X-Request-Id'],
+      exposedHeaders: ['X-Request-Id', 'X-Response-Time'],
       maxAge: 86_400,
     }),
   )
 
+  // Dodo signs the raw webhook bytes. This route-specific parser must run
+  // before express.json consumes the body for every other endpoint.
+  app.use('/billing/dodo/webhook', express.raw({ type: '*/*', limit: '1mb' }))
   app.use(express.json({ limit: '1mb' }))
   app.use(express.urlencoded({ extended: true, limit: '1mb' }))
 
@@ -81,13 +90,18 @@ export function createApp(): Express {
   })
 
   app.use('/auth', authRouter)
+  app.use('/billing', billingRouter)
   app.use('/me', meRouter)
   app.use('/resumes', resumesRouter)
   app.use('/portals', portalsRouter)
   app.use('/portal-accounts', portalAccountsRouter)
   app.use('/hunt', huntRouter)
+  app.use('/intake', intakeRouter)
   app.use('/applications', applicationsRouter)
   app.use('/referrals', referralsRouter)
+  app.use('/notifications', notificationsRouter)
+  app.use('/outreach', outreachRouter)
+  app.use('/inbox', inboxRouter)
   app.use('/dashboard', dashboardRouter)
 
   app.use(notFoundHandler)

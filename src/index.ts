@@ -1,12 +1,18 @@
 import type { Server } from 'node:http'
 import { createApp } from './app.js'
 import { env, hasDatabase, hasRedis, hasSupabaseStorage } from './config/env.js'
-import { closeDatabase, pingDatabase } from './db/client.js'
+import { closeDatabase, pingDatabase, warmPool } from './db/client.js'
 import { logger } from './lib/logger.js'
-import { startLinkedInReferralScheduler } from './services/linkedin-referrals.js'
+import { registerQueueImplementations } from './queues/register.js'
+import { attachLiveGateway } from './live/gateway.js'
 
 const app = createApp()
-const stopLinkedInReferralScheduler = startLinkedInReferralScheduler()
+
+// This process produces work; it never consumes it. The daily sweeps that used
+// to run on a `setInterval` here are BullMQ job schedulers owned by the worker
+// now — an interval inside the web process duplicated on every replica and
+// died with the dyno.
+registerQueueImplementations()
 
 const server: Server = app.listen(env.PORT, () => {
   logger.info(
@@ -33,9 +39,17 @@ const server: Server = app.listen(env.PORT, () => {
   logger.warn('Stubbed: referral draft generation only. See /readyz.')
 
   if (hasDatabase) {
-    void pingDatabase().then((result) => {
-      if (result.ok) logger.info('connected to postgres')
-      else logger.error({ error: result.error }, 'could not reach postgres')
+    void pingDatabase().then(async (result) => {
+      if (!result.ok) {
+        logger.error({ error: result.error }, 'could not reach postgres')
+        return
+      }
+      // Pay the connection handshakes now, while nobody is waiting on them.
+      // The UI opens several authenticated reads in parallel on page load.
+      // Warm the full API share so those requests reuse established sessions
+      // instead of paying a remote TLS/auth handshake for the extra clients.
+      const opened = await warmPool(env.DATABASE_POOL_MAX)
+      logger.info({ connections: opened }, 'connected to postgres')
     })
   }
 })
@@ -50,7 +64,6 @@ let shuttingDown = false
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
-  stopLinkedInReferralScheduler()
   logger.info({ signal }, 'shutting down')
 
   const force = setTimeout(() => {
@@ -70,6 +83,9 @@ async function shutdown(signal: string): Promise<void> {
     process.exit(error ? 1 : 0)
   })
 }
+
+// The live view shares the HTTP server rather than opening a second port.
+attachLiveGateway(server)
 
 process.on('SIGTERM', () => void shutdown('SIGTERM'))
 process.on('SIGINT', () => void shutdown('SIGINT'))

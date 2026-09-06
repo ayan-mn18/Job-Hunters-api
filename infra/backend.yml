@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Job Hunters backend on a small EC2 host with SSM-managed Docker deployment
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  AmiId:
+    Type: AWS::EC2::Image::Id
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.small
+      - t3.medium
+  EnvironmentParameterName:
+    Type: String
+    Default: /job-hunters/prod/env
+  RepositoryUrl:
+    Type: String
+    Default: https://github.com/ayan-mn18/Job-Hunters-api.git
+  BranchName:
+    Type: String
+    Default: feat/huntly-rebuild
+
+Resources:
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: job-hunters-ec2
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadJobHuntersEnvironment
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${EnvironmentParameterName}
+      Tags:
+        - Key: App
+          Value: job-hunters
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: job-hunters-ec2
+      Roles:
+        - !Ref InstanceRole
+
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTPS and HTTP redirect for Job Hunters API
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Public HTTP for ACME and redirect
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: Public HTTPS API and WebSocket
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - Description: Outbound provider and update access
+          IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: job-hunters-backend
+        - Key: App
+          Value: job-hunters
+
+  BackendInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref BackendSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 30
+            Encrypted: true
+            DeleteOnTermination: true
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        InstanceMetadataTags: enabled
+      Tags:
+        - Key: Name
+          Value: job-hunters-backend
+        - Key: App
+          Value: job-hunters
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get install -y ca-certificates curl git gnupg jq nginx snapd unzip
+
+          if ! command -v aws >/dev/null 2>&1; then
+            curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            /tmp/aws/install
+          fi
+
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+          apt-get update
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          systemctl enable --now docker
+
+          if ! id jobhunters >/dev/null 2>&1; then
+            useradd --system --create-home --shell /usr/sbin/nologin jobhunters
+          fi
+          usermod -aG docker jobhunters
+          install -d -o jobhunters -g jobhunters /opt/job-hunters
+
+          cat > /etc/nginx/sites-available/job-hunters <<'NGINX'
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              server_name _;
+
+              location ^~ /.well-known/acme-challenge/ {
+                  root /var/www/certbot;
+                  default_type text/plain;
+              }
+
+              location / {
+                  proxy_pass http://127.0.0.1:46460;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_connect_timeout 5s;
+                  proxy_read_timeout 60s;
+              }
+
+              location /live/ {
+                  proxy_pass http://127.0.0.1:46460;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 3600s;
+              }
+          }
+          NGINX
+          rm -f /etc/nginx/sites-enabled/default
+          ln -sfn /etc/nginx/sites-available/job-hunters /etc/nginx/sites-enabled/job-hunters
+          install -d -m 0755 /var/www/certbot/.well-known/acme-challenge
+          nginx -t
+          systemctl enable --now nginx
+
+          cat > /etc/systemd/system/job-hunters.service <<'SERVICE'
+          [Unit]
+          Description=Job Hunters Docker stack
+          Wants=network-online.target docker.service
+          After=network-online.target docker.service
+
+          [Service]
+          Type=simple
+          User=jobhunters
+          Group=jobhunters
+          WorkingDirectory=/opt/job-hunters
+          ExecStart=/usr/bin/docker compose --env-file /etc/job-hunters.env up
+          ExecStop=/usr/bin/docker compose --env-file /etc/job-hunters.env down
+          Restart=always
+          RestartSec=10
+          NoNewPrivileges=true
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          cat > /usr/local/bin/deploy-job-hunters <<'DEPLOY'
+          #!/bin/bash
+          set -euo pipefail
+          APP_DIR=/opt/job-hunters
+          REPOSITORY="${RepositoryUrl}"
+          BRANCH="${BranchName}"
+          REGION="${AWS::Region}"
+          PARAMETER_NAME="${EnvironmentParameterName}"
+
+          if [ ! -d "$APP_DIR/.git" ]; then
+            rm -rf "$APP_DIR"
+            install -d -o jobhunters -g jobhunters "$APP_DIR"
+            git clone --branch "$BRANCH" --single-branch "$REPOSITORY" "$APP_DIR"
+          fi
+
+          HOME=/root git config --global --add safe.directory "$APP_DIR"
+          git -C "$APP_DIR" fetch --prune origin
+          git -C "$APP_DIR" checkout --force "$BRANCH"
+          git -C "$APP_DIR" reset --hard "origin/$BRANCH"
+
+          TEMP_FILE=$(mktemp)
+          trap 'rm -f "$TEMP_FILE"' EXIT
+          aws ssm get-parameter --region "$REGION" --name "$PARAMETER_NAME" --with-decryption --query Parameter.Value --output text > "$TEMP_FILE"
+          test -s "$TEMP_FILE"
+          install -o root -g jobhunters -m 640 "$TEMP_FILE" /etc/job-hunters.env
+          ln -sfn /etc/job-hunters.env "$APP_DIR/.env"
+
+          cd "$APP_DIR"
+          docker compose --env-file /etc/job-hunters.env build api
+          docker compose --env-file /etc/job-hunters.env build worker
+          docker compose --env-file /etc/job-hunters.env build runner
+          docker compose --env-file /etc/job-hunters.env run --rm --no-deps api node dist/db/migrate.js
+          systemctl enable job-hunters
+          systemctl restart job-hunters
+
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:46460/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker compose --env-file /etc/job-hunters.env ps
+          docker compose --env-file /etc/job-hunters.env logs --tail=120 api worker runner
+          exit 1
+          DEPLOY
+          chmod 750 /usr/local/bin/deploy-job-hunters
+          systemctl daemon-reload
+          systemctl enable job-hunters
+
+          # A small swap file protects the image build from transient memory
+          # pressure. Browser concurrency is still intentionally limited to 1.
+          if [ ! -f /swapfile ]; then
+            fallocate -l 2G /swapfile
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+          fi
+
+  BackendEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: job-hunters-backend
+        - Key: App
+          Value: job-hunters
+
+  BackendEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt BackendEip.AllocationId
+      InstanceId: !Ref BackendInstance
+
+Outputs:
+  InstanceId:
+    Value: !Ref BackendInstance
+  PublicIp:
+    Value: !GetAtt BackendEip.PublicIp
+  ApiHttpUrl:
+    Value: !Sub http://${BackendEip}
+  ApiHttpsUrl:
+    Value: !Sub https://${BackendEip}

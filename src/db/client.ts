@@ -31,7 +31,13 @@ export function getPool(): pg.Pool {
       // while skipping chain verification — the standard Supabase setup.
       ssl: env.DATABASE_SSL ? { rejectUnauthorized: false } : false,
       connectionTimeoutMillis: 10_000,
-      idleTimeoutMillis: 30_000,
+      // Opening a connection to a remote Postgres costs TCP, TLS and auth
+      // round trips — measured at ~1.5s against Supabase from here, against
+      // ~175ms for a query on an open one. Reaping idle connections after
+      // thirty seconds meant any user arriving after a quiet minute paid that
+      // 1.5s again. Keeping them means the pool is warm when someone shows up.
+      idleTimeoutMillis: 0,
+      keepAlive: true,
     })
 
     pool.on('error', (error) => {
@@ -57,6 +63,39 @@ export const db = new Proxy({} as NodePgDatabase<typeof schema>, {
     return Reflect.get(getDb(), property, receiver)
   },
 })
+
+/**
+ * Opens connections at boot so the first real requests do not pay for the
+ * handshake. The API passes its full pool share here because the SPA starts
+ * several reads in parallel; the smaller default remains useful for scripts.
+ * Failures are logged and swallowed: a database that is not reachable yet
+ * must not stop the process from starting and reporting that on `/healthz`.
+ */
+export async function warmPool(connections = 3): Promise<number> {
+  if (!hasDatabase) return 0
+  const pool = getPool()
+  const clients = await Promise.all(
+    Array.from({ length: Math.min(connections, env.DATABASE_POOL_MAX) }, async () => {
+      try {
+        const client = await pool.connect()
+        await client.query('select 1')
+        return client
+      } catch (error) {
+        logger.warn({ err: error }, 'could not pre-warm a database connection')
+        return null
+      }
+    }),
+  )
+  // Released together, so each `connect()` above had to open its own socket
+  // rather than handing the same one round.
+  let opened = 0
+  for (const client of clients) {
+    if (!client) continue
+    client.release()
+    opened += 1
+  }
+  return opened
+}
 
 export async function pingDatabase(): Promise<{ ok: boolean; error?: string }> {
   if (!hasDatabase) return { ok: false, error: 'DATABASE_URL not set' }

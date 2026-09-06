@@ -86,8 +86,11 @@ portalsRouter.get(
  * NOTE: this only records intent. Actually holding a portal session —
  * cookies, credentials, 2FA — is the scraping workstream's problem and
  * deliberately not modelled here. Nothing secret is written by this endpoint.
- * TODO(scraper-workstream): once the credential vault exists, this should also
- * kick off the "verify the session still works" check.
+ * The credential vault now exists (`lib/credential-vault.ts`, per-user keys),
+ * so what is still missing is narrower than it was: connecting a portal here
+ * does not verify that a stored session for it still works. A user can
+ * therefore see a portal marked connected whose session expired weeks ago,
+ * and only find out when a run returns nothing.
  */
 portalsRouter.put(
   '/:id',

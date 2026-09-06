@@ -3,11 +3,28 @@ import { db } from '../db/client.js'
 import { huntCandidates, huntRunJobs, huntRuns } from '../db/schema.js'
 import { badRequest, notFound } from '../lib/errors.js'
 import { assertApplicationQueueConfigured, enqueueApprovedCandidates } from './application-queue.js'
+import { describeMissing, readApplyFields } from '../persona/apply-fields.js'
 
 export async function approveDailyBatch(userId: string, runId: string, selectedIds: string[]) {
   assertApplicationQueueConfigured()
   const uniqueIds = [...new Set(selectedIds)].slice(0, 100)
   if (uniqueIds.length === 0) throw badRequest('Select at least one job to approve.')
+
+  // Check the form answers here, before anything is queued. Without this the
+  // run starts, every attempt reaches loadPortalProfile, and a missing phone
+  // number surfaces as a column of failed applications instead of one
+  // question. Approval is the moment the user commits to applying, so it is
+  // the right place to find out.
+  const applyFields = await readApplyFields(userId)
+  if (!applyFields.hasBaseResume) {
+    throw badRequest('Upload a resume before applying — every application needs one attached.')
+  }
+  if (applyFields.missingRequired.length > 0) {
+    throw badRequest(
+      `Before applying, Hunty needs your ${describeMissing(applyFields.missingRequired)}. ` +
+        'Every application form asks for it.',
+    )
+  }
 
   const [run] = await db
     .select()

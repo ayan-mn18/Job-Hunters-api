@@ -73,7 +73,11 @@ export async function saveExistingPortalAccount(
   if (portalId !== 'wellfound') {
     throw badRequest('Password login is not supported for this portal.')
   }
-  const encryptedCredentials = encryptCredential<PasswordCredential>({ kind: 'password', email, password })
+  const encryptedCredentials = await encryptCredential<PasswordCredential>(userId, {
+    kind: 'password',
+    email,
+    password,
+  })
   return storeAccount({
     userId,
     portalId,
@@ -107,7 +111,7 @@ export async function provisionPortalAccount(userId: string, portalId: string) {
   }
 
   const password = generatePortalPassword()
-  const encryptedCredentials = encryptCredential<PasswordCredential>({
+  const encryptedCredentials = await encryptCredential<PasswordCredential>(userId, {
     kind: 'password',
     email: profile.email,
     password,
@@ -169,7 +173,7 @@ export async function syncPortalProfile(userId: string, portalId: string) {
     throw badRequest('This portal profile requires its OAuth flow to be completed manually.')
   }
   if (!account.encryptedCredentials) throw badRequest('Portal credentials are missing.')
-  const credential = decryptCredential<PasswordCredential>(account.encryptedCredentials)
+  const credential = await decryptCredential<PasswordCredential>(userId, account.encryptedCredentials)
 
   const browser = await launchAutomationBrowser()
   const scratch = await mkdtemp(path.join(os.tmpdir(), 'huntly-profile-'))

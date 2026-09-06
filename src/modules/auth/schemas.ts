@@ -44,8 +44,14 @@ export const changePasswordSchema = z.object({
   newPassword: passwordSchema,
 })
 
+export const googleCallbackSchema = z.object({
+  code: z.string().min(1),
+  state: z.string().min(1),
+})
+
 export type SignUpInput = z.infer<typeof signUpSchema>
 export type SignInInput = z.infer<typeof signInSchema>
 export type RefreshInput = z.infer<typeof refreshSchema>
 export type LogoutInput = z.infer<typeof logoutSchema>
 export type ChangePasswordInput = z.infer<typeof changePasswordSchema>
+export type GoogleCallbackInput = z.infer<typeof googleCallbackSchema>

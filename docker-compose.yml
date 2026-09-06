@@ -1,0 +1,83 @@
+# Local stack: the three processes plus Redis.
+#
+# Postgres is deliberately absent — the project runs against Supabase, and
+# pointing local development at a different database than production is how
+# schema drift starts. Set DATABASE_URL to your Supabase pooler URL in .env.
+#
+#   docker compose up --build
+#
+# The gate this file exists to satisfy: a machine with no Chrome, no Node and
+# no Playwright installed can bring the whole product up.
+
+services:
+  redis:
+    image: redis:7-alpine
+    # Persist queue state across restarts. Without it, a compose restart
+    # silently drops every scheduled job and queued application.
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: 46460
+      REDIS_URL: redis://redis:6379
+      # Pool sizes are per process and the Supabase session pooler allows 15
+      # connections in total. Three services at the default 10 ask for 30 and
+      # get `EMAXCONNSESSION` under load. The API serves requests, so it takes
+      # the largest share.
+      DATABASE_POOL_MAX: 6
+    ports:
+      - '127.0.0.1:46460:46460'
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      REDIS_URL: redis://redis:6379
+      DATABASE_POOL_MAX: 4
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      REDIS_URL: redis://redis:6379
+      PORTAL_AUTOMATION_ENABLED: 'true'
+      RUNNER_APPLY_CONCURRENCY: 1
+      # The runner is browser-bound, not query-bound. It needs very few.
+      DATABASE_POOL_MAX: 3
+    # Chromium crashes on heavy pages with the default 64 MB /dev/shm. The
+    # launch flags also pass --disable-dev-shm-usage; both together is belt and
+    # braces, and cheap.
+    shm_size: '1gb'
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data:

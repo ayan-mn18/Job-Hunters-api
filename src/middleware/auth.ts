@@ -20,6 +20,8 @@ declare global {
     interface Request {
       user?: AuthenticatedUser
       requestId?: string
+      /** Server-side handling time, filled in by the responseTime middleware. */
+      durationMs?: number
     }
   }
 }

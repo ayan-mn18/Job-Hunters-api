@@ -5,13 +5,11 @@ import { db } from '../../db/client.js'
 import {
   activityEvents,
   applications,
-  huntSpecs,
   huntCandidates,
   huntRunJobs,
   huntRuns,
   jobSources,
   jobs,
-  referrals,
   userPortals,
 } from '../../db/schema.js'
 import { notFound } from '../../lib/errors.js'
@@ -65,6 +63,11 @@ const jobsQuerySchema = z
     minScore: z.coerce.number().int().min(0).max(100).optional(),
     maxScore: z.coerce.number().int().min(0).max(100).optional(),
     remote: z.enum(['remote', 'hybrid', 'onsite', 'unknown']).optional(),
+    /**
+     * "Asks for at most N years." Postings that never state a figure are
+     * excluded rather than assumed to qualify — the filter means what it says.
+     */
+    maxExperience: z.coerce.number().int().min(0).max(50).optional(),
     foundOn: isoDay.optional(),
     postedOn: isoDay.optional(),
   })
@@ -75,35 +78,39 @@ const jobsQuerySchema = z
 const jobDetailQuerySchema = z.object({ runId: z.string().uuid() })
 const jobParamSchema = z.object({ jobId: z.string().uuid() })
 
-function salaryFromText(value: string | null): string | null {
-  if (!value) return null
-  const matches = value.matchAll(
-    /[$€£₹]\s?[\d,.]+(?:\.\d+)?\s?(?:k|m|l|lakh|lakhs|crore|crores)?(?:\s*(?:-|–|—|to)\s*[$€£₹]?\s?[\d,.]+(?:\.\d+)?\s?(?:k|m|l|lakh|lakhs|crore|crores)?)?(?:\s*(?:per\s+(?:hour|month|year)|hourly|monthly|yearly|\/hr|\/mo|\/yr|p\.a\.|lpa))?/gi,
-  )
-  for (const match of matches) {
-    const candidate = match[0].replace(/\s+/g, ' ').trim()
-    const start = match.index ?? 0
-    const context = value.slice(Math.max(0, start - 80), start + match[0].length + 80)
-    const explicitPayContext = /salary|compensation|base pay|pay range|annual pay|remuneration/i.test(context)
-    const range = /(?:-|–|—|\bto\b)/i.test(candidate)
-    if (explicitPayContext || range) return candidate
-  }
-  return null
+/**
+ * Salary and experience are parsed once, at scrape time, and stored. This used
+ * to run a regex over every description on every request — the same answer,
+ * recomputed per page view, and unfilterable because it existed only in the
+ * response.
+ */
+function salaryOf(job: {
+  salaryText: string | null
+  salaryMin: string | null
+  salaryMax: string | null
+  salaryCurrency: string | null
+  salaryPeriod: string | null
+}): string | null {
+  if (job.salaryText) return job.salaryText
+  const min = job.salaryMin === null ? null : Number(job.salaryMin)
+  const max = job.salaryMax === null ? null : Number(job.salaryMax)
+  if (min === null && max === null) return null
+  const format = (value: number): string => Math.round(value).toLocaleString('en-US')
+  const body = min !== null && max !== null && min !== max
+    ? `${format(min)}–${format(max)}`
+    : format((min ?? max) as number)
+  return `${job.salaryCurrency ? `${job.salaryCurrency} ` : ''}${body}${job.salaryPeriod ? ` per ${job.salaryPeriod}` : ''}`
 }
-function plainDescription(value: string | null): string {
-  if (!value) return ''
-  return value
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/\s+/g, ' ')
-    .trim()
+
+function experienceOf(job: { experienceMin: number | null; experienceMax: number | null }): string | null {
+  const { experienceMin: min, experienceMax: max } = job
+  if (min === null && max === null) return null
+  const unit = (value: number): string => (value === 1 ? 'year' : 'years')
+  if (min !== null && max !== null && min !== max) return `${min}–${max} ${unit(max)}`
+  if (min === 0 && max === null) return 'No experience required'
+  if (min !== null && max === null) return `${min}+ ${unit(min)}`
+  const only = (max ?? min) as number
+  return `${only} ${unit(only)}`
 }
 
 
@@ -123,55 +130,73 @@ dashboardRouter.get(
 
     // "Today" means today in APP_TIMEZONE, not UTC — otherwise the counter
     // resets at 05:30 IST and the user watches their progress vanish.
-    const appliedLocalDate = localDate(applications.appliedAt)
-    const today = todayLocal()
     const appliedDayKey = localDateKey(applications.appliedAt)
 
-    const [
-      [appliedTodayRow],
-      statusCounts,
-      [portalRow],
-      [pendingReferralRow],
-      [referralsTodayRow],
-      activeDays,
-      recentApplications,
-      activity,
-      [specRow],
-    ] = await Promise.all([
-      db
-        .select({ value: count() })
-        .from(applications)
-        .where(and(eq(applications.userId, auth.id), sql`${appliedLocalDate} = ${today}`)),
+    type DashboardSummary = {
+      applied_today: number
+      status_counts: Record<string, number>
+      jobs_found: number
+      portals_connected: number
+      pending_referrals: number
+      referrals_today: number
+      daily_target: number | null
+    }
 
-      db
-        .select({ status: applications.status, value: count() })
-        .from(applications)
-        .where(eq(applications.userId, auth.id))
-        .groupBy(applications.status),
-
-      db
-        .select({
-          jobsFound: sql<number>`coalesce(sum(${userPortals.jobsFound}), 0)::int`,
-          connected: sql<number>`count(*)::int`,
-        })
-        .from(userPortals)
-        .where(and(eq(userPortals.userId, auth.id), eq(userPortals.connected, true))),
-
-      db
-        .select({ value: count() })
-        .from(referrals)
-        .where(and(eq(referrals.userId, auth.id), eq(referrals.handled, false))),
-
-      db
-        .select({ value: count() })
-        .from(referrals)
-        .where(
-          and(
-            eq(referrals.userId, auth.id),
-            sql`${localDate(referrals.receivedAt)} = ${today}`,
-          ),
-        ),
-
+    // The Den used to make nine independent database round trips. They were
+    // launched together, but the pool has six connections and the database is
+    // remote, so the request still took multiple network waves. Keep the two
+    // lists separate, but fold all counters into one database call.
+    const [summaryRows, activeDays, recentApplications, activity] = await Promise.all([
+      db.execute(
+        sql<DashboardSummary>`
+          select
+            coalesce((
+              select count(*)::int
+              from ${applications}
+              where ${applications.userId} = ${auth.id}
+                and ${localDate(applications.appliedAt)} = ${todayLocal()}
+            ), 0)::int as applied_today,
+            coalesce((
+              select json_object_agg(status, value)
+              from (
+                select ${applications.status} as status, count(*)::int as value
+                from ${applications}
+                where ${applications.userId} = ${auth.id}
+                group by ${applications.status}
+              ) as status_counts
+            ), '{}'::json)::json as status_counts,
+            coalesce((
+              select sum(${userPortals.jobsFound})::int
+              from ${userPortals}
+              where ${userPortals.userId} = ${auth.id}
+                and ${userPortals.connected} = true
+            ), 0)::int as jobs_found,
+            (
+              select count(*)::int
+              from ${userPortals}
+              where ${userPortals.userId} = ${auth.id}
+                and ${userPortals.connected} = true
+            ) as portals_connected,
+            (
+              select count(*)::int
+              from referrals
+              where user_id = ${auth.id}
+                and handled = false
+            ) as pending_referrals,
+            (
+              select count(*)::int
+              from referrals
+              where user_id = ${auth.id}
+                and ${localDate(sql.raw('referrals.received_at'))} = ${todayLocal()}
+            ) as referrals_today,
+            (
+              select daily_target
+              from hunt_specs
+              where user_id = ${auth.id}
+              limit 1
+            ) as daily_target
+        `,
+      ),
       // Distinct days with at least one application — the streak input.
       db
         .selectDistinct({
@@ -195,9 +220,9 @@ dashboardRouter.get(
         .where(eq(activityEvents.userId, auth.id))
         .orderBy(desc(activityEvents.createdAt))
         .limit(query.activityLimit),
-
-      db.select().from(huntSpecs).where(eq(huntSpecs.userId, auth.id)).limit(1),
     ])
+
+    const summary = summaryRows.rows[0] as DashboardSummary | undefined
 
     const counts: Record<string, number> = {
       queued: 0,
@@ -206,11 +231,13 @@ dashboardRouter.get(
       interview: 0,
       rejected: 0,
     }
-    for (const row of statusCounts) counts[row.status] = row.value
+    for (const [status, value] of Object.entries(summary?.status_counts ?? {})) {
+      counts[status] = Number(value)
+    }
 
     const totalApplications = Object.values(counts).reduce((a, b) => a + b, 0)
-    const appliedToday = appliedTodayRow?.value ?? 0
-    const dailyTarget = specRow?.dailyTarget ?? 50
+    const appliedToday = Number(summary?.applied_today ?? 0)
+    const dailyTarget = Number(summary?.daily_target ?? 50)
 
     const now = new Date()
 
@@ -230,14 +257,14 @@ dashboardRouter.get(
       stats: {
         appliedToday,
         totalApplications,
-        jobsScraped: portalRow?.jobsFound ?? 0,
-        portalsConnected: portalRow?.connected ?? 0,
+        jobsScraped: Number(summary?.jobs_found ?? 0),
+        portalsConnected: Number(summary?.portals_connected ?? 0),
         interviews: counts.interview ?? 0,
         viewed: counts.viewed ?? 0,
         queued: counts.queued ?? 0,
         rejected: counts.rejected ?? 0,
-        referralsWaiting: pendingReferralRow?.value ?? 0,
-        referralsToday: referralsTodayRow?.value ?? 0,
+        referralsWaiting: Number(summary?.pending_referrals ?? 0),
+        referralsToday: Number(summary?.referrals_today ?? 0),
       },
       recentApplications: recentApplications.map((row) => ({
         id: row.id,
@@ -355,6 +382,7 @@ dashboardRouter.get(
       query.minScore !== undefined ? gte(huntRunJobs.score, query.minScore) : undefined,
       query.maxScore !== undefined ? lte(huntRunJobs.score, query.maxScore) : undefined,
       query.remote ? eq(jobs.remoteMode, query.remote) : undefined,
+      query.maxExperience !== undefined ? lte(jobs.experienceMin, query.maxExperience) : undefined,
       query.foundOn
         ? sql`${localDate(huntRunJobs.discoveredAt)} = ${query.foundOn}::date`
         : undefined,
@@ -369,11 +397,6 @@ dashboardRouter.get(
       eq(huntRunJobs.runId, run.id),
       eq(huntRunJobs.userId, auth.id),
     )
-    const [detailedRunCount] = await db
-      .select({ value: count() })
-      .from(huntRunJobs)
-      .where(baseDetailedWhere)
-    const historical = Number(detailedRunCount?.value ?? 0) === 0
     const offset = (query.page - 1) * query.pageSize
 
     let counts: Record<string, number> = { all: 0 }
@@ -381,18 +404,24 @@ dashboardRouter.get(
     let items: Array<Record<string, unknown>> = []
     let total = 0
 
+    // The status counts double as the "is this run detailed?" check: their sum
+    // is the run's row count, so the extra count query this used to run first —
+    // serially, before anything else could start — is gone.
+    const statusRows = await db
+      .select({ status: huntRunJobs.status, value: count() })
+      .from(huntRunJobs)
+      .where(baseDetailedWhere)
+      .groupBy(huntRunJobs.status)
+    const detailedRunTotal = statusRows.reduce((sum, row) => sum + Number(row.value), 0)
+    const historical = detailedRunTotal === 0
+
     if (!historical) {
-      const [totalRow, statusRows, portalRows, detailed] = await Promise.all([
+      const [totalRow, portalRows, detailed] = await Promise.all([
         db
           .select({ value: count() })
           .from(huntRunJobs)
           .innerJoin(jobs, eq(huntRunJobs.jobId, jobs.id))
           .where(detailedWhere),
-        db
-          .select({ status: huntRunJobs.status, value: count() })
-          .from(huntRunJobs)
-          .where(baseDetailedWhere)
-          .groupBy(huntRunJobs.status),
         db
           .select({ portal: huntRunJobs.sourcePortal, value: count() })
           .from(huntRunJobs)
@@ -420,7 +449,7 @@ dashboardRouter.get(
           .offset(offset),
       ])
       total = Number(totalRow[0]?.value ?? 0)
-      counts = { all: Number(detailedRunCount?.value ?? 0) }
+      counts = { all: detailedRunTotal }
       for (const row of statusRows) counts[row.status] = Number(row.value)
       portals = Object.fromEntries(portalRows.map((row) => [row.portal, Number(row.value)]))
       items = detailed.map(({ runJob, job, candidateId, candidateStatus }) => ({
@@ -431,12 +460,17 @@ dashboardRouter.get(
         company: job.company,
         locations: job.locations,
         remote: job.remoteMode,
+        employmentType: job.employmentType,
         sourcePortal: runJob.sourcePortal,
         status: runJob.status,
         candidateStatus,
         score: runJob.score,
         skills: job.skills,
-        salary: salaryFromText(job.descriptionText),
+        salary: salaryOf(job),
+        experience: experienceOf(job),
+        experienceMin: job.experienceMin,
+        experienceMax: job.experienceMax,
+        responsibilities: job.responsibilities,
         jobUrl: job.canonicalUrl,
         postedAt: job.postedAt.toISOString(),
         discoveredAt: runJob.discoveredAt.toISOString(),
@@ -458,6 +492,7 @@ dashboardRouter.get(
             )
           : undefined,
         query.remote ? eq(jobs.remoteMode, query.remote) : undefined,
+        query.maxExperience !== undefined ? lte(jobs.experienceMin, query.maxExperience) : undefined,
         query.foundOn ? sql`${localDate(jobSources.fetchedAt)} = ${query.foundOn}::date` : undefined,
         query.postedOn ? sql`${localDate(jobs.postedAt)} = ${query.postedOn}::date` : undefined,
         query.portal ? eq(jobSources.portalId, query.portal) : undefined,
@@ -501,12 +536,17 @@ dashboardRouter.get(
         company: job.company,
         locations: job.locations,
         remote: job.remoteMode,
+        employmentType: job.employmentType,
         sourcePortal,
         status: 'scraped',
         candidateStatus: null,
         score: null,
         skills: job.skills,
-        salary: salaryFromText(job.descriptionText),
+        salary: salaryOf(job),
+        experience: experienceOf(job),
+        experienceMin: job.experienceMin,
+        experienceMax: job.experienceMax,
+        responsibilities: job.responsibilities,
         jobUrl: job.canonicalUrl,
         postedAt: job.postedAt.toISOString(),
         discoveredAt: new Date(discoveredAt).toISOString(),
@@ -545,47 +585,44 @@ dashboardRouter.get(
     const auth = currentUser(req)
     const query = validatedQuery<z.infer<typeof jobDetailQuerySchema>>(req)
     const jobId = pathParam(req, 'jobId')
-    const [run] = await db
-      .select()
-      .from(huntRuns)
-      .where(and(eq(huntRuns.id, query.runId), eq(huntRuns.userId, auth.id)))
-      .limit(1)
-    if (!run) throw notFound('Hunt run not found')
 
-    const [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1)
-    if (!job) throw notFound('Job not found')
-    const [runJob] = await db
-      .select()
-      .from(huntRunJobs)
-      .where(
+    // One round trip instead of five. The run, the job, this user's row for it,
+    // the candidate and the source it came from are all reachable by join, and
+    // the old sequential version paid full network latency for each.
+    const [row] = await db
+      .select({
+        run: huntRuns,
+        job: jobs,
+        runJob: huntRunJobs,
+        candidate: huntCandidates,
+        source: jobSources,
+      })
+      .from(huntRuns)
+      .innerJoin(jobs, eq(jobs.id, jobId))
+      .leftJoin(
+        huntRunJobs,
         and(
-          eq(huntRunJobs.runId, run.id),
+          eq(huntRunJobs.runId, huntRuns.id),
+          eq(huntRunJobs.jobId, jobs.id),
           eq(huntRunJobs.userId, auth.id),
-          eq(huntRunJobs.jobId, job.id),
         ),
       )
-      .limit(1)
-    const windowStart = run.startedAt ?? run.createdAt
-    const windowEnd = run.finishedAt ?? new Date()
-    const [source] = await db
-      .select()
-      .from(jobSources)
-      .where(
-        and(
-          eq(jobSources.jobId, job.id),
-          runJob
-            ? eq(jobSources.portalId, runJob.sourcePortal)
-            : and(gte(jobSources.fetchedAt, windowStart), lte(jobSources.fetchedAt, windowEnd)),
-        ),
+      .leftJoin(
+        huntCandidates,
+        and(eq(huntCandidates.runId, huntRuns.id), eq(huntCandidates.jobId, jobs.id)),
       )
-      .orderBy(desc(jobSources.fetchedAt))
+      .leftJoin(jobSources, eq(jobSources.jobId, jobs.id))
+      .where(and(eq(huntRuns.id, query.runId), eq(huntRuns.userId, auth.id)))
+      // Prefer the source row for the portal this run used, then the newest.
+      .orderBy(
+        desc(sql`(${jobSources.portalId} is not distinct from ${huntRunJobs.sourcePortal})`),
+        desc(jobSources.fetchedAt),
+      )
       .limit(1)
+
+    if (!row) throw notFound('Hunt run not found')
+    const { run, job, runJob, candidate, source } = row
     if (!runJob && !source) throw notFound('Job was not found in this hunt run')
-    const [candidate] = await db
-      .select()
-      .from(huntCandidates)
-      .where(and(eq(huntCandidates.runId, run.id), eq(huntCandidates.jobId, job.id)))
-      .limit(1)
 
     ok(res, {
       id: runJob?.id ?? `historical:${run.id}:${job.id}`,
@@ -595,6 +632,7 @@ dashboardRouter.get(
       company: job.company,
       locations: job.locations,
       remote: job.remoteMode,
+      employmentType: job.employmentType,
       sourcePortal: runJob?.sourcePortal ?? source?.portalId ?? '',
       status: runJob?.status ?? 'scraped',
       candidateStatus: candidate?.status ?? null,
@@ -602,8 +640,14 @@ dashboardRouter.get(
       scoreBreakdown: runJob?.scoreBreakdown ?? candidate?.scoreBreakdown ?? null,
       reasons: runJob?.reasons ?? candidate?.reasons ?? [],
       skills: job.skills,
-      salary: salaryFromText(job.descriptionText),
-      description: plainDescription(job.descriptionText),
+      salary: salaryOf(job),
+      experience: experienceOf(job),
+      experienceMin: job.experienceMin,
+      experienceMax: job.experienceMax,
+      experienceText: job.experienceText,
+      responsibilities: job.responsibilities,
+      description: job.descriptionText ?? '',
+      descriptionHtml: job.descriptionHtml,
       jobUrl: job.canonicalUrl,
       applyUrl: job.applyUrl ?? source?.applyUrl ?? null,
       postedAt: job.postedAt.toISOString(),

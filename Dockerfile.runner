@@ -1,0 +1,41 @@
+# Browser work: applying, LinkedIn sessions, referral sweeps.
+#
+# The base image tag must match the installed `playwright-core` version — the
+# driver and the browser are versioned together, and a mismatch fails at launch
+# with an unhelpful protocol error. Bump both in the same commit.
+#
+# This is the reason the processes are split at all. The image is roughly an
+# order of magnitude larger than the other two, and it scales on memory
+# (~300–500 MB per live browser context) rather than on request throughput.
+FROM mcr.microsoft.com/playwright:v1.62.1-noble AS build
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src ./src
+COPY scripts ./scripts
+RUN npm run build
+
+FROM mcr.microsoft.com/playwright:v1.62.1-noble AS runtime
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+COPY --from=build /app/dist ./dist
+
+# Playwright resolves the Chromium the base image installed under
+# PLAYWRIGHT_BROWSERS_PATH. Deliberately not a hardcoded executable path: that
+# pins a build number which changes on every Playwright bump.
+ENV BROWSER_IN_CONTAINER=true
+
+# The Playwright image ships this unprivileged user with the browser sandbox
+# dependencies already in place.
+USER pwuser
+
+CMD ["node", "dist/runner.js"]

@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { htmlToInlineText } from './html.js'
 import type { NormalisedLocation, RemoteMode } from './types.js'
 
 const COUNTRY_PATTERNS: Array<[RegExp, string]> = [
@@ -19,28 +20,14 @@ const COUNTRY_PATTERNS: Array<[RegExp, string]> = [
 const REMOTE_RE = /\b(remote|anywhere|work from home|wfh|distributed|worldwide)\b/i
 const HYBRID_RE = /\bhybrid\b/i
 
-const SKILL_NAMES = [
-  'TypeScript', 'JavaScript', 'React', 'Next.js', 'Node.js', 'Express.js', 'Python',
-  'Java', 'Go', 'Golang', 'C++', 'C#', 'Ruby', 'PHP', 'Swift', 'Kotlin', 'Android',
-  'iOS', 'PostgreSQL', 'MySQL', 'MongoDB', 'Redis', 'AWS', 'Azure', 'GCP', 'Docker',
-  'Kubernetes', 'Terraform', 'GraphQL', 'REST', 'Machine Learning', 'Data Science',
-  'Generative AI', 'LLM', 'LangChain', 'RAG', 'Figma', 'Product Management', 'SQL',
-]
-
+/**
+ * Kept as a thin alias so older callers keep working. New code should use
+ * `htmlToText` from ./html.js, which preserves the line and list structure the
+ * section-aware extractors depend on.
+ */
 export function stripHtml(html: string | undefined): string | undefined {
-  if (!html) return undefined
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&#39;|&rsquo;|&lsquo;/g, "'")
-    .replace(/&quot;|&ldquo;|&rdquo;/g, '"')
-    .replace(/\s+/g, ' ')
-    .trim()
+  const text = htmlToInlineText(html)
+  return text.length > 0 ? text : undefined
 }
 
 export function normaliseLocations(raw: string): NormalisedLocation[] {
@@ -107,15 +94,6 @@ export function fingerprintOf(title: string, company: string, locations: Normali
 
 export function hashText(text: string): string {
   return crypto.createHash('sha256').update(text.trim().replace(/\s+/g, ' ')).digest('hex')
-}
-
-export function extractSkills(text: string): string[] {
-  const found = new Set<string>()
-  for (const skill of SKILL_NAMES) {
-    const escaped = skill.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    if (new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i').test(text)) found.add(skill)
-  }
-  return [...found]
 }
 
 export function keywordTokens(text: string): string[] {

@@ -1,13 +1,17 @@
 import { logger } from '../lib/logger.js'
 
 /**
- * ============================ STUBBED WORKSTREAM ============================
- * Writing the actual recommendation from someone's resume + the job
- * description is a generation task owned elsewhere. This is the seam.
+ * The seam between "a referral needs a draft" and whatever writes it.
  *
- * TODO(generation-workstream): register a real generator via
- * `setReferralDraftGenerator()` at boot. See docs/.
- * ===========================================================================
+ * The fallback below assembles a template from the facts on the row and is
+ * what runs when no model is configured — deliberately plain rather than
+ * trying to sound warm about a person it knows nothing about.
+ *
+ * `services/referral-draft-model.ts` registers the real generator at boot via
+ * `registerReferralDraftGenerator()`, called from `queues/register.ts`. The
+ * indirection stays because the fallback has to keep working: a deployment
+ * with no `ANTHROPIC_API_KEY` should still produce something a person can
+ * send.
  */
 
 export interface ReferralDraftRequest {
