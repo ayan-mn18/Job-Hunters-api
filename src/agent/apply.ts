@@ -80,6 +80,7 @@ export async function applyWithAgent(params: {
   resumePath: string
   job?: { title?: string; company?: string }
   onAsk?: (question: string) => Promise<string | null>
+  maxSteps?: number
   onStep?: (step: { index: number; tool: string; result: string; ok: boolean }) => void | Promise<void>
 }): Promise<ApplyOutcome> {
   const { session, dryRun } = params
@@ -109,6 +110,7 @@ export async function applyWithAgent(params: {
     allowedDomains: domainsForApplyUrl(applyUrl),
     dryRun,
     files: { resume: params.resumePath },
+    ...(params.maxSteps ? { maxSteps: params.maxSteps } : {}),
     initialNavigationError,
     ...(params.onStep
       ? {

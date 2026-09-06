@@ -5,6 +5,7 @@ import { eq } from 'drizzle-orm'
 import { z } from 'zod/v4'
 import { db } from '../db/client.js'
 import { applications, playgroundRuns } from '../db/schema.js'
+import { env } from '../config/env.js'
 import { logger } from '../lib/logger.js'
 import { downloadObject } from '../lib/storage.js'
 import { structured } from '../model/gateway.js'
@@ -288,6 +289,7 @@ async function finishApplication(
           },
           files: { resume: resumePath },
           onAsk,
+          maxSteps: env.PLAYGROUND_AGENT_MAX_STEPS,
           onStep: (step) => publishStep(ref, step),
         })
       : applyWithAgent({
@@ -299,6 +301,7 @@ async function finishApplication(
           resumePath,
           job: { title: chosen.title, company: chosen.company },
           onAsk,
+          maxSteps: env.PLAYGROUND_AGENT_MAX_STEPS,
           onStep: (step) => publishStep(ref, step),
         })
 

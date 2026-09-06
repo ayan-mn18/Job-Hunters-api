@@ -86,6 +86,12 @@ export interface ApplyParams {
    * where there is nobody to ask and the agent must leave the field blank.
    */
   onAsk?: (question: string) => Promise<string | null>
+  /**
+   * Overrides the agent's step ceiling. A batch run leaves this alone; a
+   * playground run raises it, because there the agent fills the whole form
+   * rather than the leftovers the deterministic ladder could not.
+   */
+  maxSteps?: number
 }
 
 export interface ApplyOutcome {

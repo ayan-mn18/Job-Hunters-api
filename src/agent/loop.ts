@@ -173,6 +173,16 @@ export async function runAgent(options: AgentRunOptions): Promise<AgentRunResult
     note: 'The agent took no action.',
   }
   let stoppedBecause: AgentRunResult['stoppedBecause'] = 'max-steps'
+  /**
+   * What the agent actually did, as opposed to what it says it did.
+   *
+   * A run that hits the step ceiling never reaches `done`, and the report was
+   * therefore empty — on a live Greenhouse form that meant seven filled fields,
+   * a résumé and a LinkedIn URL all recorded as nothing having happened. The
+   * loop watched every one of those succeed; there is no reason to depend on
+   * the model to remember them.
+   */
+  const observed: string[] = []
   let wantPicture = false
   let previous = ''
   let steps = 0
@@ -328,6 +338,11 @@ export async function runAgent(options: AgentRunOptions): Promise<AgentRunResult
 
     if (call.function.name === 'screenshot') wantPicture = true
 
+    if (outcome.ok && ['fill', 'select', 'upload'].includes(call.function.name)) {
+      const element = observation.elements.find((item) => item.ref === Number(args.ref))
+      if (element && !observed.includes(element.label)) observed.push(element.label)
+    }
+
     await options.onStep?.({
       index: steps,
       tool: call.function.name,
@@ -382,8 +397,18 @@ export async function runAgent(options: AgentRunOptions): Promise<AgentRunResult
   }
 
   if (stoppedBecause === 'max-steps' && report.note === 'The agent took no action.') {
-    report.note = `Ran out of steps after ${steps}.`
+    report.note = observed.length
+      ? `Ran out of steps after ${steps}, with ${observed.length} field${observed.length === 1 ? '' : 's'} filled.`
+      : `Ran out of steps after ${steps}.`
   }
 
-  return { ...report, steps, stoppedBecause }
+  // The agent's own list wins where it exists — it knows which of its actions
+  // it considers part of the answer — and the observed ones fill the gap when
+  // it never got to say.
+  const filled = [...report.filled]
+  for (const label of observed) {
+    if (!filled.includes(label)) filled.push(label)
+  }
+
+  return { ...report, filled, steps, stoppedBecause }
 }

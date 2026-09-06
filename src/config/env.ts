@@ -199,8 +199,23 @@ const schema = z.object({
    * agent step, not per application, and is deliberately generous.
    */
   APPLY_AGENT_MAX_TOKENS: z.coerce.number().int().positive().default(8000),
-  /** Hard stop on a runaway agent loop. */
+  /**
+   * Hard stop on a runaway agent loop, for the batch tier.
+   *
+   * Low because the deterministic ladder has already filled most of the form
+   * by the time the agent runs there; it only handles the leftovers.
+   */
   APPLY_AGENT_MAX_STEPS: z.coerce.number().int().positive().default(18),
+  /**
+   * The same ceiling for a playground run, where the agent fills the whole
+   * form itself.
+   *
+   * A live Anthropic posting on Greenhouse has 53 interactive elements and ran
+   * out of room at 18 with the form most of the way done — which is the worst
+   * possible place to stop, because nothing was submitted and the work was
+   * thrown away.
+   */
+  PLAYGROUND_AGENT_MAX_STEPS: z.coerce.number().int().positive().default(45),
   /**
    * Ceiling on a single agent step. Without one, a stalled `act()` parks the
    * application in `applying` forever: apply jobs are queued with
