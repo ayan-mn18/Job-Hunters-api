@@ -118,10 +118,24 @@ function readable(result: string): string {
   return line.length > 180 ? `${line.slice(0, 177)}…` : line
 }
 
+/**
+ * A step, published — and a heartbeat.
+ *
+ * Touching `updated_at` is what lets startup reconciliation tell a run whose
+ * runner died from one that is alive and simply deep in a long agent phase.
+ * Without it, a second runner booting reclaims the first one's work and stops
+ * its browser mid-form. That happened.
+ */
 export function publishStep(
   run: { id: string; userId: string },
   step: { index: number; tool: string; result: string; ok: boolean },
 ): void {
+  void db
+    .update(playgroundRuns)
+    .set({ updatedAt: new Date() })
+    .where(eq(playgroundRuns.id, run.id))
+    .catch(() => undefined)
+
   const event: PlaygroundEvent = {
     type: 'step',
     runId: run.id,

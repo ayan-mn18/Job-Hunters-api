@@ -12,10 +12,11 @@ import { structured } from '../model/gateway.js'
 import { openSession, type AgentSession } from '../browser/session.js'
 import { profileFor } from '../browser/profiles.js'
 import { applyWithAgent, factsForAgent } from '../agent/apply.js'
+import { fillForm, submitForm } from '../hunt/apply/fill.js'
 import { toDiscoveryAdapter } from '../hunt/discovery/runner.js'
 import { loadPortalProfile } from '../hunt/portal-profile.js'
 import { allSkills, skillById, skillForUrl, skillsWith } from '../skills/registry.js'
-import type { SiteSkill } from '../skills/types.js'
+import type { ApplyOutcome, SiteSkill } from '../skills/types.js'
 import type { ScrapedJob } from '../hunt/discovery/types.js'
 import { awaitReply, clearReplies } from './replies.js'
 import { loadRunUnscoped, publishStep, say, setState } from './store.js'
@@ -324,7 +325,69 @@ async function finishApplication(
           onStep: (step) => publishStep(ref, step),
         })
 
-  let outcome = await attemptApply()
+  /**
+   * The deterministic ladder first, exactly as the batch tier does it.
+   *
+   * The playground went straight to the agent, and on a live Anthropic posting
+   * — 53 interactive elements, most of them custom comboboxes needing two
+   * clicks each — it ran out of steps at forty-five with the form most of the
+   * way done. Nothing was submitted and the work was thrown away.
+   *
+   * Recipes, the answer cache and the label heuristics fill a known form in
+   * seconds and for nothing, which is exactly why the hunt's agent only needs
+   * eighteen steps: there it handles leftovers, not the whole form. Skills that
+   * know better than the ladder — Work at a Startup, whose application is a
+   * message to the founders — keep their own path.
+   */
+  let ladder: Awaited<ReturnType<typeof fillForm>> | null = null
+  if (!applySkill?.apply && state.session) {
+    await state.session.page
+      .goto(applyUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 })
+      .catch(() => undefined)
+    ladder = await fillForm({
+      page: state.session.page,
+      url: applyUrl,
+      userId: run.userId,
+      attemptId: run.id,
+      profile,
+      resumePath,
+    })
+    const filledCount = ladder.fields.filter((field) => field.filled).length
+    await say(
+      ref,
+      'agent',
+      `Filled ${filledCount} of ${ladder.fields.length} fields from what I already know about this form.`,
+    )
+  }
+
+  // The agent runs only for what the ladder could not reach: no form found, or
+  // questions left unanswered. It never runs instead of it.
+  let outcome =
+    ladder && ladder.fields.length > 0 && ladder.unresolved.length === 0
+      ? {
+          reached: 'form' as const,
+          filled: ladder.fields
+            .filter((field) => field.filled)
+            .map((field) => ({ label: field.label, value: '[recipe]' })),
+          blocked: [] as ApplyOutcome['blocked'],
+          note: 'Filled from the recipe for this form.',
+          steps: 0,
+        }
+      : await attemptApply()
+
+  if (ladder) {
+    // The ladder's work is part of the answer whether or not the agent ran.
+    const known = new Set(outcome.filled.map((field) => field.label))
+    outcome = {
+      ...outcome,
+      filled: [
+        ...ladder.fields
+          .filter((field) => field.filled && !known.has(field.label))
+          .map((field) => ({ label: field.label, value: '[recipe]' })),
+        ...outcome.filled,
+      ],
+    }
+  }
 
   /**
    * A sign-in wall is a question, not a failure.
@@ -350,7 +413,7 @@ async function finishApplication(
     }
   }
 
-  for (const blocked of outcome.blocked) {
+  for (const blocked of outcome.blocked as ApplyOutcome['blocked']) {
     if (blocked.why === 'sensitive_field') {
       await say(
         ref,
@@ -358,6 +421,27 @@ async function finishApplication(
         `Left "${blocked.label}" blank on purpose. Huntly never answers visa, demographic or disability questions for you.`,
         'refused',
       )
+    }
+  }
+
+  /**
+   * Submitting, through the one guarded control.
+   *
+   * `submitForm` checks the kill switch and the dry-run flag immediately before
+   * the click and reports why it held back. The agent has its own submit tool
+   * for flows that need one, so this only runs when the agent did not already
+   * submit.
+   */
+  if (!run.dryRun && outcome.reached === 'form' && state.session) {
+    const submitted = await submitForm({
+      page: state.session.page,
+      url: applyUrl,
+      dryRun: run.dryRun,
+    })
+    if (submitted.submitted) {
+      outcome = { ...outcome, reached: 'submitted' as const }
+    } else if (submitted.heldBack) {
+      await say(ref, 'agent', `Did not submit: ${submitted.heldBack.replace(/_/g, ' ')}.`)
     }
   }
 

@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNotNull } from 'drizzle-orm'
+import { and, inArray, isNotNull, lt } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { playgroundRuns } from '../db/schema.js'
 import { logger } from '../lib/logger.js'
@@ -19,7 +19,14 @@ import { say, setState } from './store.js'
  * resumed — the browser it was driving is mid-form and nothing remembers where
  * — so this stops the browser and marks the run failed rather than pretending
  * it can be picked back up.
+ *
+ * Only runs that have gone quiet are reclaimed. A live status alone is not
+ * enough: a run can legitimately be in flight in another process, and an
+ * earlier version of this stopped a healthy run's browser mid-form the moment
+ * a second runner booted. Every published step touches `updated_at`, so
+ * silence for this long means nobody is driving it.
  */
+const STALE_AFTER_MS = 10 * 60_000
 
 /** Statuses that mean a run believed it was still in progress. */
 const LIVE = ['queued', 'launching', 'searching', 'shortlisted', 'applying', 'blocked'] as const
@@ -28,7 +35,13 @@ export async function reconcileInterruptedPlaygroundRuns(): Promise<void> {
   const stranded = await db
     .select()
     .from(playgroundRuns)
-    .where(and(inArray(playgroundRuns.status, [...LIVE]), isNotNull(playgroundRuns.browserSessionId)))
+    .where(
+      and(
+        inArray(playgroundRuns.status, [...LIVE]),
+        isNotNull(playgroundRuns.browserSessionId),
+        lt(playgroundRuns.updatedAt, new Date(Date.now() - STALE_AFTER_MS)),
+      ),
+    )
 
   if (stranded.length === 0) return
   logger.warn({ count: stranded.length }, 'stopping browsers left behind by an interrupted runner')
@@ -45,12 +58,12 @@ export async function reconcileInterruptedPlaygroundRuns(): Promise<void> {
     await clearReplies(run.id)
 
     const ref = { id: run.id, userId: run.userId }
-    await say(ref, 'huntly', 'The server restarted while this was running, so it stopped.').catch(
+    await say(ref, 'huntly', 'This run went quiet and the server stopped it.').catch(
       () => undefined,
     )
     await setState(ref, {
       status: 'failed',
-      error: 'The server restarted while this run was in progress.',
+      error: 'The run went quiet — the process driving it went away.',
       completedAt: new Date(),
     }).catch(() => undefined)
   }
