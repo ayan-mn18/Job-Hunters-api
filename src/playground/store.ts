@@ -104,6 +104,20 @@ export async function say(
   })
 }
 
+/**
+ * A step line, trimmed to something a person can read.
+ *
+ * Playwright's failures carry the whole element — every attribute, the action
+ * it was attempting, the actionability checks it was waiting on. That is
+ * exactly what you want in a log and exactly what you do not want dumped into
+ * a conversation panel, where one of them buries everything said before it.
+ * The full text is still in the runner's logs.
+ */
+function readable(result: string): string {
+  const line = result.replace(/\s+/g, ' ').trim()
+  return line.length > 180 ? `${line.slice(0, 177)}…` : line
+}
+
 export function publishStep(
   run: { id: string; userId: string },
   step: { index: number; tool: string; result: string; ok: boolean },
@@ -113,7 +127,7 @@ export function publishStep(
     runId: run.id,
     index: step.index,
     tool: step.tool,
-    result: step.result,
+    result: readable(step.result),
     ok: step.ok,
   }
   publishPlaygroundEvent(run.userId, event)
