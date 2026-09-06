@@ -123,6 +123,28 @@ export const applyAttemptStatusEnum = pgEnum('apply_attempt_status', [
   'failed',
 ])
 
+export const playgroundRunStatusEnum = pgEnum('playground_run_status', [
+  'queued',
+  'launching',
+  'searching',
+  /** A match is chosen and waiting for a person to press Apply. */
+  'shortlisted',
+  'applying',
+  /** The agent asked a question and cannot continue until it is answered. */
+  'blocked',
+  'submitted',
+  'failed',
+  'cancelled',
+])
+
+export const playgroundSpeakerEnum = pgEnum('playground_speaker', [
+  'huntly',
+  'agent',
+  'llm',
+  'user',
+  'system',
+])
+
 export const activityKindEnum = pgEnum('activity_kind', [
   'application_submitted',
   'application_status_changed',
@@ -636,6 +658,86 @@ export const applyAttempts = pgTable(
   },
   (table) => [index('apply_attempts_candidate_idx').on(table.candidateId, table.createdAt)],
 )
+
+/* --------------------------------------------------------------- playground */
+
+/**
+ * One job, watched from the prompt to the confirmation email.
+ *
+ * Kept apart from `hunt_runs` deliberately. A hunt is a batch that optimises
+ * for throughput and reports a status per row; a playground run is a single
+ * application that optimises for being watchable, and it stops and asks rather
+ * than parking itself for review. Sharing a table would have meant every
+ * column on it meaning two things.
+ *
+ * It still writes a real `applications` row when it submits — the application
+ * is real, only the framing around it is different.
+ */
+export const playgroundRuns = pgTable(
+  'playground_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    /** What the user typed. */
+    prompt: text('prompt').notNull(),
+    status: playgroundRunStatusEnum('status').notNull().default('queued'),
+    /** The site skill this run resolved to, e.g. `workatastartup`. */
+    skillId: text('skill_id'),
+    /** Where a person can watch and take over. */
+    liveUrl: text('live_url'),
+    browserSessionId: text('browser_session_id'),
+    /** Ranked postings, as shown in the browser panel. */
+    shortlist: jsonb('shortlist'),
+    /** The posting the user pressed Apply on. */
+    chosenJobUrl: text('chosen_job_url'),
+    chosenJobTitle: text('chosen_job_title'),
+    chosenJobCompany: text('chosen_job_company'),
+    /** The application row this produced, once it submitted. */
+    applicationId: uuid('application_id').references(() => applications.id, {
+      onDelete: 'set null',
+    }),
+    /** What went in, and what was deliberately left out. */
+    filledFields: jsonb('filled_fields'),
+    blockedFields: jsonb('blocked_fields'),
+    /** The question the run is waiting on, when status is `blocked`. */
+    pendingQuestion: text('pending_question'),
+    dryRun: boolean('dry_run').notNull().default(true),
+    emailSentAt: timestamp('email_sent_at', { withTimezone: true }),
+    error: text('error'),
+    startedAt: timestamp('started_at', { withTimezone: true }),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    ...timestamps,
+  },
+  (table) => [index('playground_runs_user_idx').on(table.userId, table.createdAt)],
+)
+
+/**
+ * Everything said during a run, by anyone.
+ *
+ * Persisted rather than held in the socket because a run outlives a browser
+ * tab: reopening a run has to show what was already said, and a question the
+ * agent asked while nobody was watching still needs answering.
+ */
+export const playgroundMessages = pgTable(
+  'playground_messages',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    runId: uuid('run_id')
+      .notNull()
+      .references(() => playgroundRuns.id, { onDelete: 'cascade' }),
+    speaker: playgroundSpeakerEnum('speaker').notNull(),
+    body: text('body').notNull(),
+    /** Renders as a callout: `stuck`, `refused`, `success`. */
+    kind: text('kind'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().default(now),
+  },
+  (table) => [index('playground_messages_run_idx').on(table.runId, table.createdAt)],
+)
+
+export type PlaygroundRun = typeof playgroundRuns.$inferSelect
+export type PlaygroundMessage = typeof playgroundMessages.$inferSelect
 
 /* ------------------------------------------------------------- applications */
 

@@ -2,7 +2,7 @@
   "name": "job-hunters-api",
   "version": "0.1.0",
   "private": true,
-  "description": "Backend for Job Hunters — automated job applying and referral triage.",
+  "description": "Backend for Job Hunters \u2014 automated job applying and referral triage.",
   "type": "module",
   "engines": {
     "node": ">=20.11"
@@ -28,12 +28,14 @@
     "skills:check": "tsx src/scripts/check-skills.ts",
     "browser:verify": "tsx src/scripts/verify-browser.ts",
     "skills:source": "tsx src/scripts/verify-skill-source.ts",
-    "agent:verify": "tsx src/scripts/verify-agent.ts"
+    "agent:verify": "tsx src/scripts/verify-agent.ts",
+    "playground:smoke": "tsx src/scripts/playground-smoke.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.122.0",
     "@node-rs/bcrypt": "^1.10.8",
     "@supabase/supabase-js": "^2.58.0",
+    "@types/nodemailer": "^8.0.1",
     "bullmq": "^6.0.9",
     "cors": "^2.8.5",
     "dodopayments": "^2.49.0",
@@ -47,6 +49,7 @@
     "jsonwebtoken": "^9.0.2",
     "mammoth": "^1.12.0",
     "multer": "^2.0.2",
+    "nodemailer": "^10.0.0",
     "pg": "^8.16.3",
     "pino": "^9.13.1",
     "pino-http": "^10.5.0",

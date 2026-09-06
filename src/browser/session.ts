@@ -4,6 +4,7 @@ import { serviceUnavailable } from '../lib/errors.js'
 import { logger } from '../lib/logger.js'
 import { launchAutomationBrowser } from '../hunt/browser.js'
 import { createBrowser, getBrowser, stopBrowser, type BrowserSessionInfo } from './client.js'
+import { createSemaphore, type Slot } from './limit.js'
 
 /**
  * One way to get a browser, for every part of the product that needs one.
@@ -41,6 +42,14 @@ export interface SessionOptions {
   viewport?: { width: number; height: number }
   /** Off by default; a recording is only worth its storage when reviewed. */
   record?: boolean
+  /**
+   * How long to wait for a free browser before giving up.
+   *
+   * A queued background job can wait; someone who just clicked a button in the
+   * UI should be told to try again instead of watching a spinner. Callers on a
+   * request path pass something short.
+   */
+  maxWaitMs?: number
 }
 
 export interface AgentSession {
@@ -62,13 +71,25 @@ export interface SessionCost {
   proxyMb: number
 }
 
+/**
+ * Every browser in this process, hosted or local, passes through here.
+ *
+ * One counter rather than one per lane: the limit that matters is the number
+ * of browsers alive at once, and the provider enforces its own version of it
+ * without caring which part of the product asked.
+ */
+const browsers = createSemaphore(env.BROWSER_MAX_CONCURRENT_SESSIONS)
+
+/** Long enough for an application ahead in the queue to finish and let go. */
+const DEFAULT_WAIT_MS = 90_000
+
 function assertAutomationEnabled(): void {
   if (!env.PORTAL_AUTOMATION_ENABLED) {
     throw serviceUnavailable('Portal automation is disabled. Set PORTAL_AUTOMATION_ENABLED=true.')
   }
 }
 
-async function openHosted(options: SessionOptions): Promise<AgentSession> {
+async function openHosted(options: SessionOptions, slot: Slot): Promise<AgentSession> {
   const viewport = options.viewport ?? { width: 1280, height: 900 }
   let info: BrowserSessionInfo
   try {
@@ -120,15 +141,22 @@ async function openHosted(options: SessionOptions): Promise<AgentSession> {
       // Disconnect first so no in-flight command races the shutdown, then stop
       // the session itself. Skipping the second call leaks a browser that
       // bills until its timeout.
-      await browser.close().catch(() => undefined)
-      await stopBrowser(info.id).catch((error: unknown) => {
-        logger.error({ err: error, sessionId: info.id }, 'hosted browser did not stop — it will bill until its timeout')
-      })
+      try {
+        await browser.close().catch(() => undefined)
+        await stopBrowser(info.id).catch((error: unknown) => {
+          logger.error({ err: error, sessionId: info.id }, 'hosted browser did not stop — it will bill until its timeout')
+        })
+      } finally {
+        // The slot is freed even when stopping failed. Holding it would make
+        // one stuck session permanently shrink the pool, which is a worse
+        // outcome than briefly exceeding the count by one.
+        slot.release()
+      }
     },
   }
 }
 
-async function openLocal(options: SessionOptions): Promise<AgentSession> {
+async function openLocal(options: SessionOptions, slot: Slot): Promise<AgentSession> {
   const browser = await launchAutomationBrowser()
   const context = await browser.newContext({
     viewport: options.viewport ?? { width: 1280, height: 900 },
@@ -146,15 +174,29 @@ async function openLocal(options: SessionOptions): Promise<AgentSession> {
     async close() {
       if (closed) return
       closed = true
-      await context.close().catch(() => undefined)
-      await browser.close().catch(() => undefined)
+      try {
+        await context.close().catch(() => undefined)
+        await browser.close().catch(() => undefined)
+      } finally {
+        slot.release()
+      }
     },
   }
 }
 
 export async function openSession(options: SessionOptions): Promise<AgentSession> {
   assertAutomationEnabled()
-  return browserProvider === 'browser-use' ? openHosted(options) : openLocal(options)
+
+  const slot = await browsers.acquire(options.label, options.maxWaitMs ?? DEFAULT_WAIT_MS)
+  try {
+    return browserProvider === 'browser-use'
+      ? await openHosted(options, slot)
+      : await openLocal(options, slot)
+  } catch (error) {
+    // Only reached when the browser never came up, so nothing holds the slot.
+    slot.release()
+    throw error
+  }
 }
 
 /**

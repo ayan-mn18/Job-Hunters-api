@@ -42,6 +42,11 @@ A state machine per attempt, watchable live over a WebSocket, with takeover
 when it gets stuck. Portal recipes first, heuristics second, a model last —
 and every answer it learns is cached so the next person never waits for it.
 
+**The playground** — [docs/playground.md](docs/playground.md)
+One job, watched end to end: the hosted browser embedded live, the conversation
+between the agent and the model beside it, and a run that stops and asks when it
+meets a question nobody can answer from a résumé.
+
 **Site skills** — [docs/skills.md](docs/skills.md)
 Everything known about one website — where it may navigate, whether it needs a
 signed-in profile, how to list its postings, how to complete its application —

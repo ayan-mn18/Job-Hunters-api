@@ -4,7 +4,7 @@ import { closeApplicationQueue, reconcileInterruptedApplications, startApplicati
 import { logger } from './lib/logger.js'
 import { closeRedis } from './lib/redis.js'
 import { closeQueues, startWorker } from './queues/index.js'
-import { QUEUE, type OutreachJobData, type ReferralSyncJobData } from './queues/names.js'
+import { QUEUE, type OutreachJobData, type PlaygroundJobData, type ReferralSyncJobData } from './queues/names.js'
 import { registerQueueImplementations } from './queues/register.js'
 import { withUserResourceLock } from './lib/locks.js'
 import { syncLinkedInReferrals } from './services/linkedin-referrals.js'
@@ -14,6 +14,7 @@ import { CheckpointError } from './skills/linkedin/send.js'
 import { send as sendOnLinkedIn } from './skills/linkedin/outreach.js'
 import { NoLinkedInSessionError, openLinkedInSession } from './skills/linkedin/session.js'
 import { sweepOutreachTargets } from './outreach/sweep.js'
+import { executePlaygroundRun } from './playground/run.js'
 
 /**
  * The runner process: everything that needs a real browser.
@@ -144,6 +145,27 @@ startWorker<OutreachJobData>(
 )
 
 logger.info('Huntly browser runner started')
+
+/**
+ * A playground run: one job, watched, with somebody able to answer questions
+ * partway through.
+ *
+ * No user lock, unlike every other browser job here. A run is started by a
+ * person who is sitting and watching it, and making them queue behind a
+ * scheduled referral sync would make the feature feel broken. The browser
+ * ceiling in `openSession` is what actually bounds concurrency.
+ *
+ * `attempts: 1`. A run that failed halfway has already told the user what
+ * happened, and silently starting a second browser to redo an application is
+ * the last thing anyone wants.
+ */
+startWorker<PlaygroundJobData>(
+  QUEUE.playground,
+  async (job) => {
+    await executePlaygroundRun(job.data.runId)
+  },
+  { concurrency: 2, lockDuration: 120_000, maxStalledCount: 1 },
+)
 
 let stopping = false
 async function shutdown(signal: string): Promise<void> {

@@ -151,6 +151,27 @@ Managed proxy egress is $5/GB against $0.20/GB direct, so
 `BROWSER_USE_PROXY_COUNTRY` is empty by default and individual site skills opt
 in. Only LinkedIn does.
 
+### How many at once
+
+`BROWSER_MAX_CONCURRENT_SESSIONS` (default **4**) caps browsers, not jobs.
+Applying is not the only lane that opens one — LinkedIn outreach, the referral
+sync and interactive sign-in each open their own — so a limit on the apply
+queue alone counts a fraction of the browsers and calls it the total.
+
+Browser Use refuses the eleventh concurrent session until a lifetime spend
+threshold is passed, and a refusal surfaces as an application failing for a
+reason that has nothing to do with the application. Four leaves room for the
+other lanes underneath that ceiling.
+
+Callers past the limit queue in `openSession` and then fail with a clear
+message rather than hanging: background work waits up to 90 seconds,
+interactive sign-in waits 10, because somebody is watching that one.
+`RUNNER_APPLY_CONCURRENCY` is capped at the same number — letting it exceed the
+browser limit only moves the waiting into a job that is holding a BullMQ lock.
+
+The count is **per process**. Two runner replicas at 4 is 8 browsers, not 4; if
+you scale the runner horizontally, divide this rather than leaving it.
+
 `BROWSER_PROVIDER=local` keeps the old path for offline development.
 
 ### The local provider

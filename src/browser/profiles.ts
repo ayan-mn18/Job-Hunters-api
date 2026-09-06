@@ -108,6 +108,10 @@ export async function beginInteractiveLogin(params: {
     profileId,
     proxyCountry: params.proxyCountry ?? null,
     timeoutMinutes: params.minutes ?? 20,
+    // Somebody is sitting in front of this. If every browser is busy, say so
+    // in a few seconds rather than holding the request open for a minute and a
+    // half while they watch a spinner.
+    maxWaitMs: 10_000,
   })
 
   if (!session.liveUrl || !session.sessionId) {

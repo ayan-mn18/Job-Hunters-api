@@ -31,6 +31,14 @@ export interface ToolContext {
   files: Record<string, string>
   /** Refreshed by the loop after each action. */
   observation: Observation
+  /**
+   * Puts a question to the person watching, and waits for their answer.
+   *
+   * Present only when somebody is actually watching — a batch run has nobody
+   * to ask, and offering the tool there would strand the agent waiting for a
+   * reply that cannot come. Returns null when nobody answered in time.
+   */
+  onAsk?: (question: string) => Promise<string | null>
 }
 
 export interface ToolResult {
@@ -165,6 +173,36 @@ const BASE_TOOLS = [
   },
 ] as const
 
+/**
+ * Asking, rather than guessing.
+ *
+ * The failure this replaces is an agent inventing a notice period or a salary
+ * because the form demanded one. A wrong answer on somebody's application is
+ * not a bug you can apologise for afterwards, so when the facts do not contain
+ * something, the correct move is to stop and ask the person whose application
+ * it is.
+ */
+const ASK_TOOL = {
+  type: 'function',
+  function: {
+    name: 'ask',
+    description:
+      'Ask the person watching for something the facts do not contain — a number, a date, a decision. '
+      + 'Use this instead of guessing. Do not use it for questions about visa status, demographics or '
+      + 'disability: those are never answered, by anyone, and belong in "blocked".',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description: 'One plain question. Say which field it is for and why you cannot fill it.',
+        },
+      },
+      required: ['question'],
+    },
+  },
+} as const
+
 const SUBMIT_TOOL = {
   type: 'function',
   function: {
@@ -179,9 +217,14 @@ const SUBMIT_TOOL = {
   },
 } as const
 
-/** The tool list for this run. In a dry run, submitting is simply not offered. */
-export function toolsFor(dryRun: boolean): unknown[] {
-  return dryRun ? [...BASE_TOOLS] : [...BASE_TOOLS, SUBMIT_TOOL]
+/**
+ * The tool list for this run.
+ *
+ * In a dry run, submitting is not offered. Asking is only offered when there is
+ * somebody to ask.
+ */
+export function toolsFor(dryRun: boolean, canAsk = false): unknown[] {
+  return [...BASE_TOOLS, ...(canAsk ? [ASK_TOOL] : []), ...(dryRun ? [] : [SUBMIT_TOOL])]
 }
 
 /* ------------------------------------------------------------------ helpers */
@@ -309,6 +352,33 @@ export async function runTool(
       await page.click(refSelector(element.ref), { timeout: 20_000 })
       await page.waitForLoadState('domcontentloaded', { timeout: 30_000 }).catch(() => undefined)
       return { ok: true, message: `Submitted via "${element.label}".` }
+    }
+
+    case 'ask': {
+      const question = String(args.question ?? '').trim()
+      if (!question) return { ok: false, message: 'Ask an actual question.' }
+      if (!context.onAsk) {
+        return {
+          ok: false,
+          message: 'Nobody is watching this run. Leave the field blank and report it in "blocked".',
+        }
+      }
+      // A refusal must not be routed around by asking the user to supply the
+      // answer instead. The list is the list.
+      if (sensitiveReason(question)) {
+        return {
+          ok: false,
+          message:
+            'That is a question this system never answers, however it is asked. Leave it blank and report it in "blocked".',
+        }
+      }
+      const answer = await context.onAsk(question)
+      return answer
+        ? { ok: true, message: `They said: ${answer}` }
+        : {
+            ok: false,
+            message: 'Nobody answered. Leave the field blank and report it in "blocked".',
+          }
     }
 
     case 'done': {

@@ -57,6 +57,11 @@ export interface AgentRunOptions {
   /** A navigation error from the deterministic tier, if one happened first. */
   initialNavigationError?: string
   maxSteps?: number
+  /**
+   * Lets the agent put a question to the person watching. Absent means nobody
+   * is there, and the `ask` tool is not offered at all.
+   */
+  onAsk?: (question: string) => Promise<string | null>
   onStep?: (step: {
     index: number
     tool: string
@@ -131,7 +136,7 @@ export async function runAgent(options: AgentRunOptions): Promise<AgentRunResult
   } = options
 
   const stepTimeout = env.APPLY_AGENT_STEP_TIMEOUT_MS
-  const tools = toolsFor(dryRun)
+  const tools = toolsFor(dryRun, Boolean(options.onAsk))
 
   const system = [
     SYSTEM_RULES,
@@ -293,14 +298,27 @@ export async function runAgent(options: AgentRunOptions): Promise<AgentRunResult
       args = {}
     }
 
-    const context: ToolContext = { page, allowedDomains, dryRun, files, observation }
+    const context: ToolContext = {
+      page,
+      allowedDomains,
+      dryRun,
+      files,
+      observation,
+      ...(options.onAsk ? { onAsk: options.onAsk } : {}),
+    }
     let outcome
     try {
-      outcome = await withDeadline(
-        `agent: ${call.function.name}`,
-        stepTimeout,
-        runTool(context, call.function.name, args),
-      )
+      outcome =
+        call.function.name === 'ask'
+          ? // No deadline: this one is waiting for a person, and `onAsk` carries
+            // its own. Capping it at the step timeout would abandon the question
+            // while they were still typing.
+            await runTool(context, call.function.name, args)
+          : await withDeadline(
+              `agent: ${call.function.name}`,
+              stepTimeout,
+              runTool(context, call.function.name, args),
+            )
     } catch (error) {
       outcome = {
         ok: false,

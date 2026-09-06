@@ -79,6 +79,7 @@ export async function applyWithAgent(params: {
   profile: PortalProfile
   resumePath: string
   job?: { title?: string; company?: string }
+  onAsk?: (question: string) => Promise<string | null>
   onStep?: (step: { index: number; tool: string; result: string; ok: boolean }) => void | Promise<void>
 }): Promise<ApplyOutcome> {
   const { session, dryRun } = params

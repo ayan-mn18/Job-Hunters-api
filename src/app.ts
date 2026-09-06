@@ -17,6 +17,7 @@ import { meRouter } from './modules/me/routes.js'
 import { notificationsRouter } from './modules/notifications/routes.js'
 import { inboxRouter } from './modules/inbox/routes.js'
 import { outreachRouter } from './modules/outreach/routes.js'
+import { playgroundRouter } from './modules/playground/routes.js'
 import { portalsRouter } from './modules/portals/routes.js'
 import { portalAccountsRouter } from './modules/portal-accounts/routes.js'
 import { referralsRouter } from './modules/referrals/routes.js'
@@ -93,6 +94,7 @@ export function createApp(): Express {
   app.use('/billing', billingRouter)
   app.use('/me', meRouter)
   app.use('/resumes', resumesRouter)
+  app.use('/playground', playgroundRouter)
   app.use('/portals', portalsRouter)
   app.use('/portal-accounts', portalAccountsRouter)
   app.use('/hunt', huntRouter)

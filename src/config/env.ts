@@ -78,8 +78,15 @@ const schema = z.object({
   APPLY_KILL_SWITCH: booleanish.default('false'),
   /** How long a blocked attempt waits for a human before parking. */
   APPLY_TAKEOVER_WINDOW_MS: z.coerce.number().int().positive().default(5 * 60_000),
-  /** Maximum concurrent application jobs on the browser runner. */
-  RUNNER_APPLY_CONCURRENCY: z.coerce.number().int().positive().max(10).default(1),
+  /**
+   * Maximum concurrent application jobs on the browser runner.
+   *
+   * Capped at the browser ceiling below. Allowing more would only queue the
+   * excess inside `openSession`, which is a worse place to wait than the job
+   * queue — a job holding a BullMQ lock while it waits for a browser is a job
+   * that can stall out and be retried for no reason.
+   */
+  RUNNER_APPLY_CONCURRENCY: z.coerce.number().int().positive().max(4).default(1),
   /**
    * Opens a real window for interactive sign-in.
    *
@@ -115,6 +122,16 @@ const schema = z.object({
   ),
   /** Minutes before a hosted session self-terminates. Also the billing cap. */
   BROWSER_SESSION_TIMEOUT_MIN: z.coerce.number().int().positive().max(240).default(15),
+  /**
+   * How many browsers may exist at once, across every part of the product.
+   *
+   * Applying is not the only thing that opens one — LinkedIn outreach, the
+   * referral sync and interactive sign-in each open their own — so this counts
+   * browsers rather than jobs. Callers past the limit queue and then fail with
+   * a clear message rather than being refused by the provider for a reason
+   * that has nothing to do with what they were doing.
+   */
+  BROWSER_MAX_CONCURRENT_SESSIONS: z.coerce.number().int().positive().max(10).default(4),
   /**
    * Hands a failed flow to Browser Use's own managed agent as a last resort.
    *
@@ -229,6 +246,20 @@ const schema = z.object({
   DODO_PAYMENTS_PRODUCT_ID: optionalString,
   DODO_PAYMENTS_RETURN_URL: optionalUrl,
 
+  /**
+   * Outgoing mail, for run confirmations.
+   *
+   * Deliberately plain SMTP rather than sending through the user's own Gmail:
+   * that would need `gmail.send`, a second restricted scope and a second
+   * consent screen, for one message. Without these the confirmation is logged
+   * and skipped, and the application it describes still stands.
+   */
+  SMTP_HOST: optionalString,
+  SMTP_PORT: z.coerce.number().int().positive().max(65535).default(587),
+  SMTP_USER: optionalString,
+  SMTP_PASSWORD: optionalString,
+  MAIL_FROM: z.string().default('Hunty <hunty@huntly.app>'),
+
   MAX_RESUME_BYTES: z.coerce.number().int().positive().default(5 * 1024 * 1024),
   MAX_PHOTO_BYTES: z.coerce.number().int().positive().default(5 * 1024 * 1024),
 
@@ -303,6 +334,9 @@ export const hasBrowserUse = Boolean(env.BROWSER_USE_API_KEY)
 /** What `openSession` will actually do, once the key situation is accounted for. */
 export const browserProvider: 'browser-use' | 'local' =
   env.BROWSER_PROVIDER === 'browser-use' && hasBrowserUse ? 'browser-use' : 'local'
+
+/** Run confirmations are logged instead of sent until SMTP is configured. */
+export const hasMailer = Boolean(env.SMTP_HOST)
 
 /** Gmail ingest is off until an OAuth client exists. */
 export const hasGmail = Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET)

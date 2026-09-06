@@ -103,6 +103,7 @@ export async function applyOnWorkAtAStartup(params: ApplyParams): Promise<ApplyO
     allowedDomains: workAtAStartupManifest.allowedDomains,
     dryRun,
     files: params.files,
+    ...(params.onAsk ? { onAsk: params.onAsk } : {}),
     onStep: params.onStep
       ? (step) => params.onStep?.({ index: step.index, tool: step.tool, result: step.result, ok: step.ok })
       : undefined,

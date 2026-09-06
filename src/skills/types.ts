@@ -81,6 +81,11 @@ export interface ApplyParams {
   /** Local paths, by keyword: `resume`, `cover-letter`. */
   files: Record<string, string>
   onStep?: (step: { index: number; tool: string; result: string; ok: boolean }) => void | Promise<void>
+  /**
+   * Lets the run put a question to the person watching. Absent in batch runs,
+   * where there is nobody to ask and the agent must leave the field blank.
+   */
+  onAsk?: (question: string) => Promise<string | null>
 }
 
 export interface ApplyOutcome {

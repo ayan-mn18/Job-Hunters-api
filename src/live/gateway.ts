@@ -2,12 +2,13 @@ import type { Server } from 'node:http'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { and, eq } from 'drizzle-orm'
 import { db } from '../db/client.js'
-import { applyAttempts } from '../db/schema.js'
+import { applyAttempts, playgroundRuns } from '../db/schema.js'
 import { env } from '../config/env.js'
 import { logger } from '../lib/logger.js'
 import { verifyAccessToken } from '../lib/jwt.js'
 import { subscribeToAttempts, type AttemptEventPayload } from '../hunt/apply/events.js'
 import { markWatching, sendTakeover, stopWatching, type TakeoverEvent } from '../hunt/apply/screencast.js'
+import { subscribeToPlayground, type PlaygroundEvent } from '../playground/events.js'
 
 /**
  * The live view socket.
@@ -22,6 +23,8 @@ import { markWatching, sendTakeover, stopWatching, type TakeoverEvent } from '..
  */
 
 const PATH = /^\/live\/([0-9a-f-]{36})$/i
+/** Playground runs get their own path so the two id spaces cannot collide. */
+const PLAYGROUND_PATH = /^\/live\/playground\/([0-9a-f-]{36})$/i
 
 /** Refreshed while a socket is open so the runner knows to keep streaming. */
 const WATCH_REFRESH_MS = 20_000
@@ -41,7 +44,8 @@ export function attachLiveGateway(server: Server): WebSocketServer {
 
   server.on('upgrade', (request, socket, head) => {
     const url = new URL(request.url ?? '', `http://${request.headers.host ?? 'localhost'}`)
-    const match = PATH.exec(url.pathname)
+    const playground = PLAYGROUND_PATH.exec(url.pathname)
+    const match = playground ?? PATH.exec(url.pathname)
     if (!match) {
       socket.destroy()
       return
@@ -57,6 +61,29 @@ export function attachLiveGateway(server: Server): WebSocketServer {
       userId = verifyAccessToken(token).sub
     } catch {
       socket.destroy()
+      return
+    }
+
+    if (playground) {
+      void (async () => {
+        // The run must belong to this user. Without this check any
+        // authenticated user could watch anyone's application being filled in.
+        const [run] = await db
+          .select({ id: playgroundRuns.id })
+          .from(playgroundRuns)
+          .where(and(eq(playgroundRuns.id, attemptId!), eq(playgroundRuns.userId, userId)))
+          .limit(1)
+          .catch(() => [])
+
+        if (!run) {
+          socket.destroy()
+          return
+        }
+
+        wss.handleUpgrade(request, socket, head, (ws) => {
+          acceptPlayground(ws, userId, attemptId!)
+        })
+      })()
       return
     }
 
@@ -115,6 +142,28 @@ export function attachLiveGateway(server: Server): WebSocketServer {
       JSON.stringify({ type: 'ready', attemptId, takeoverWindowMs: env.APPLY_TAKEOVER_WINDOW_MS }),
       () => undefined,
     )
+  }
+
+  /**
+   * A playground socket.
+   *
+   * Read-only, unlike the apply one. There is no takeover channel to forward
+   * clicks over because the hosted browser publishes its own live URL and the
+   * user clicks in the real thing — anything typed instead goes over HTTP,
+   * where it can be validated and recorded.
+   */
+  function acceptPlayground(socket: WebSocket, userId: string, runId: string): void {
+    const unsubscribe = subscribeToPlayground(userId, (payload: PlaygroundEvent) => {
+      // One socket watches one run; everything else on this user's channel
+      // belongs to a different tab.
+      if (payload.runId !== runId) return
+      if (socket.readyState !== socket.OPEN) return
+      socket.send(JSON.stringify(payload), () => undefined)
+    })
+
+    socket.on('close', unsubscribe)
+    socket.on('error', unsubscribe)
+    socket.send(JSON.stringify({ type: 'ready', runId }), () => undefined)
   }
 
   function close(client: Client): void {

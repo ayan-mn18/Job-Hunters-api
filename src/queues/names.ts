@@ -15,6 +15,7 @@ export const QUEUE = {
   inbox: 'huntly-inbox',
   referralSync: 'huntly-referral-sync',
   outreach: 'huntly-outreach',
+  playground: 'huntly-playground',
   learn: 'huntly-learn',
 } as const
 
@@ -26,6 +27,7 @@ export const BROWSER_QUEUES: QueueName[] = [
   QUEUE.session,
   QUEUE.referralSync,
   QUEUE.outreach,
+  QUEUE.playground,
 ]
 
 /** Queues that are pure CPU and IO, and so run on the worker process. */
@@ -63,4 +65,9 @@ export interface ApplyJobData {
 
 export interface OutreachJobData {
   userId: string
+}
+
+export interface PlaygroundJobData {
+  userId: string
+  runId: string
 }

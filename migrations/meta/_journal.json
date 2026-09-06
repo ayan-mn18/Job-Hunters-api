@@ -127,6 +127,13 @@
       "when": 1788699982350,
       "tag": "0018_google_oauth",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1788711694628,
+      "tag": "0019_next_mandroid",
+      "breakpoints": true
     }
   ]
 }
