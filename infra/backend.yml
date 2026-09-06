@@ -22,7 +22,7 @@ Parameters:
     Default: https://github.com/ayan-mn18/Job-Hunters-api.git
   BranchName:
     Type: String
-    Default: feat/huntly-rebuild
+    Default: main
 
 Resources:
   InstanceRole:

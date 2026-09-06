@@ -112,6 +112,7 @@ export async function applyOnWorkAtAStartup(params: ApplyParams): Promise<ApplyO
 
   return {
     reached: result.submitted ? 'submitted' : result.reachedForm ? 'form' : 'nothing',
+    canSubmit: result.canSubmit,
     // The agent is not trusted to have honoured the sensitive-question rule.
     // Anything it claims to have filled that matches the never-auto list is
     // reported as blocked regardless of what it says it did.

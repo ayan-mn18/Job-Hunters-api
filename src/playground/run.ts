@@ -19,7 +19,7 @@ import { allSkills, skillById, skillForUrl, skillsWith } from '../skills/registr
 import type { ApplyOutcome, SiteSkill } from '../skills/types.js'
 import type { ScrapedJob } from '../hunt/discovery/types.js'
 import { awaitReply, clearReplies } from './replies.js'
-import { loadRunUnscoped, publishStep, say, setState } from './store.js'
+import { loadRunUnscoped, publishStep, say, setState, touchRun } from './store.js'
 import { sendRunConfirmation } from './confirmation.js'
 
 /**
@@ -39,6 +39,7 @@ import { sendRunConfirmation } from './confirmation.js'
 /** How long the run waits on a person before giving up and closing the browser. */
 const APPROVAL_WAIT_MS = 15 * 60_000
 const ANSWER_WAIT_MS = 10 * 60_000
+const HEARTBEAT_MS = 30_000
 
 /** Postings read per run. Small: each detail page is a Firecrawl credit. */
 const SHORTLIST_POOL = 8
@@ -432,7 +433,7 @@ async function finishApplication(
    * for flows that need one, so this only runs when the agent did not already
    * submit.
    */
-  if (!run.dryRun && outcome.reached === 'form' && state.session) {
+  if (!run.dryRun && outcome.reached === 'form' && state.session && outcome.canSubmit !== false) {
     const submitted = await submitForm({
       page: state.session.page,
       url: applyUrl,
@@ -443,6 +444,13 @@ async function finishApplication(
     } else if (submitted.heldBack) {
       await say(ref, 'agent', `Did not submit: ${submitted.heldBack.replace(/_/g, ' ')}.`)
     }
+  } else if (!run.dryRun && outcome.reached === 'form' && outcome.canSubmit === false) {
+    await say(
+      ref,
+      'agent',
+      'I filled what I could, but the run ended before it was safe to submit. Nothing was sent.',
+      'stuck',
+    )
   }
 
   // A dry run that reached a filled form is a success, not a failure. Saying
@@ -506,14 +514,14 @@ async function finishApplication(
     { emailSent: confirmation.sent, to: profile.email },
   )
 
-  await say(
-    ref,
-    'huntly',
-    confirmation.sent
-      ? `Confirmation email sent to ${profile.email}.`
-      : `Applied. The confirmation email could not go out: ${confirmation.error}`,
-    confirmation.sent ? 'success' : undefined,
-  )
+  const receiptMessage = confirmation.sent
+    ? run.dryRun
+      ? `Dry-run receipt sent to ${profile.email}.`
+      : `Confirmation email sent to ${profile.email}.`
+    : run.dryRun
+      ? `Dry run complete. The receipt could not go out: ${confirmation.error}`
+      : `Applied. The confirmation email could not go out: ${confirmation.error}`
+  await say(ref, 'huntly', receiptMessage, confirmation.sent ? 'success' : undefined)
 }
 
 /** The bare hostname, for a site no skill covers. */
@@ -597,6 +605,8 @@ export async function executePlaygroundRun(runId: string): Promise<void> {
 
   const state: Teardown = { session: null, scratch: null }
   const ref = { id: run.id, userId: run.userId }
+  const heartbeat = setInterval(() => touchRun(runId), HEARTBEAT_MS)
+  heartbeat.unref()
 
   try {
     const profile = await loadPortalProfile(run.userId)
@@ -695,6 +705,7 @@ export async function executePlaygroundRun(runId: string): Promise<void> {
       .where(eq(playgroundRuns.id, runId))
       .catch(() => undefined)
   } finally {
+    clearInterval(heartbeat)
     await teardown(state, runId)
   }
 }

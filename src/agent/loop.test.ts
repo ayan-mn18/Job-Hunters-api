@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { trim } from './loop.js'
+import { finalizeAgentReport, trim } from './loop.js'
 import type { MuseMessage } from '../model/muse-spark.js'
 
 /**
@@ -53,4 +53,41 @@ describe('conversation trimming', () => {
       assert.ok(before?.role === 'assistant' && before.tool_calls, 'a tool reply lost its assistant')
     }
   })
+})
+
+it('preserves fields filled before the agent hits the step ceiling', () => {
+  const result = finalizeAgentReport(
+    {
+      reachedForm: false,
+      submitted: false,
+      filled: [],
+      blocked: [],
+      note: 'The agent took no action.',
+    },
+    ['Name', 'Email'],
+    45,
+    'max-steps',
+  )
+
+  assert.equal(result.reachedForm, true)
+  assert.deepEqual(result.filled, ['Name', 'Email'])
+  assert.equal(result.canSubmit, false)
+  assert.match(result.note, /2 fields filled/)
+})
+
+it('only an explicit completed agent turn can authorize submission', () => {
+  const result = finalizeAgentReport(
+    {
+      reachedForm: true,
+      submitted: false,
+      filled: ['Name'],
+      blocked: [],
+      note: 'All required fields are complete.',
+    },
+    [],
+    4,
+    'done',
+  )
+
+  assert.equal(result.canSubmit, true)
 })

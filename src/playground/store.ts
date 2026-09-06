@@ -146,3 +146,16 @@ export function publishStep(
   }
   publishPlaygroundEvent(run.userId, event)
 }
+
+/**
+ * Runner lease heartbeat. A playground can legitimately wait fifteen minutes
+ * for approval or ten minutes for an answer, so a timestamp written only when
+ * a step is published is not enough to distinguish that from a dead runner.
+ */
+export function touchRun(runId: string): void {
+  void db
+    .update(playgroundRuns)
+    .set({ updatedAt: new Date() })
+    .where(eq(playgroundRuns.id, runId))
+    .catch(() => undefined)
+}

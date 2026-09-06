@@ -96,6 +96,8 @@ export interface ApplyParams {
 
 export interface ApplyOutcome {
   reached: 'nothing' | 'form' | 'submitted'
+  /** False when the agent stopped before it established that submission was safe. */
+  canSubmit?: boolean
   filled: Array<{ label: string; value: string }>
   blocked: Array<{ label: string; why: string }>
   note: string

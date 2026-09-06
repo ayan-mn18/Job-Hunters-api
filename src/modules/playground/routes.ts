@@ -10,7 +10,7 @@ import { playgroundRuns } from '../../db/schema.js'
 import { getQueue } from '../../queues/index.js'
 import { QUEUE, type PlaygroundJobData } from '../../queues/names.js'
 import { postReply } from '../../playground/replies.js'
-import { listMessages, listRuns, loadRun, say } from '../../playground/store.js'
+import { listMessages, listRuns, loadRun, say, setState } from '../../playground/store.js'
 
 /**
  * The playground's HTTP surface.
@@ -80,16 +80,29 @@ playgroundRouter.post(
       .returning()
     if (!run) throw new Error('Could not create a playground run')
 
-    await say({ id: run.id, userId: user.id }, 'user', body.prompt)
+    try {
+      await say({ id: run.id, userId: user.id }, 'user', body.prompt)
 
-    // One attempt. A run that failed halfway has already said so, and quietly
-    // opening a second browser to redo an application is the last thing
-    // anybody wants.
-    await getQueue<PlaygroundJobData>(QUEUE.playground).add(
-      'run',
-      { userId: user.id, runId: run.id },
-      { attempts: 1, removeOnComplete: 50, removeOnFail: 50, jobId: `playground-${run.id}` },
-    )
+      // One attempt. A run that failed halfway has already said so, and quietly
+      // opening a second browser to redo an application is the last thing
+      // anybody wants.
+      await getQueue<PlaygroundJobData>(QUEUE.playground).add(
+        'run',
+        { userId: user.id, runId: run.id },
+        { attempts: 1, removeOnComplete: 50, removeOnFail: 50, jobId: `playground-${run.id}` },
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      await setState({ id: run.id, userId: user.id }, {
+        status: 'failed',
+        error: `Could not queue this run: ${message}`,
+        completedAt: new Date(),
+      }).catch(() => undefined)
+      await say({ id: run.id, userId: user.id }, 'huntly', 'I could not queue this run. Nothing was started.', 'stuck').catch(
+        () => undefined,
+      )
+      throw error
+    }
 
     created(res, runDto(run))
   }),

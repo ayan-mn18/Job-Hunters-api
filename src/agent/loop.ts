@@ -76,6 +76,8 @@ export interface AgentRunResult extends AgentReport {
   steps: number
   /** Why the loop ended: the agent said so, or it ran out of room. */
   stoppedBecause: 'done' | 'max-steps' | 'error'
+  /** Whether the agent reached its explicit completion turn. */
+  canSubmit: boolean
 }
 
 /**
@@ -120,6 +122,45 @@ export function trim(messages: MuseMessage[], keep = 14): MuseMessage[] {
 
 function fingerprint(observation: Observation): string {
   return `${observation.url}|${observation.elements.map((element) => `${element.ref}${element.label}${element.value}`).join(',')}`
+}
+
+/**
+ * Turn the agent's explicit report plus the actions we observed into the final
+ * result. Kept pure so the step-ceiling behavior cannot regress silently.
+ */
+export function finalizeAgentReport(
+  report: AgentReport,
+  observed: string[],
+  steps: number,
+  stoppedBecause: AgentRunResult['stoppedBecause'],
+): AgentRunResult {
+  const note =
+    stoppedBecause === 'max-steps' && report.note === 'The agent took no action.'
+      ? observed.length
+        ? `Ran out of steps after ${steps}, with ${observed.length} field${observed.length === 1 ? '' : 's'} filled.`
+        : `Ran out of steps after ${steps}.`
+      : report.note
+
+  // A model that filled a field has necessarily reached an application form,
+  // even if the step ceiling arrived before it could call `done`. Keep that
+  // work in the outcome so it is reported accurately, but do not let an
+  // incomplete conversation become permission to submit a live application.
+  const reachedForm = report.reachedForm || observed.length > 0
+
+  const filled = [...report.filled]
+  for (const label of observed) {
+    if (!filled.includes(label)) filled.push(label)
+  }
+
+  return {
+    ...report,
+    reachedForm,
+    note,
+    filled,
+    steps,
+    stoppedBecause,
+    canSubmit: stoppedBecause === 'done' && reachedForm,
+  }
 }
 
 export async function runAgent(options: AgentRunOptions): Promise<AgentRunResult> {
@@ -396,19 +437,8 @@ export async function runAgent(options: AgentRunOptions): Promise<AgentRunResult
     }
   }
 
-  if (stoppedBecause === 'max-steps' && report.note === 'The agent took no action.') {
-    report.note = observed.length
-      ? `Ran out of steps after ${steps}, with ${observed.length} field${observed.length === 1 ? '' : 's'} filled.`
-      : `Ran out of steps after ${steps}.`
-  }
-
   // The agent's own list wins where it exists — it knows which of its actions
   // it considers part of the answer — and the observed ones fill the gap when
   // it never got to say.
-  const filled = [...report.filled]
-  for (const label of observed) {
-    if (!filled.includes(label)) filled.push(label)
-  }
-
-  return { ...report, filled, steps, stoppedBecause }
+  return finalizeAgentReport(report, observed, steps, stoppedBecause)
 }

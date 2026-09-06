@@ -82,6 +82,15 @@ live status with a browser session attached has that browser stopped and the run
 marked failed. It is not resumed, because the browser it was driving is halfway
 through a form and nothing remembers where.
 
+The runner also refreshes `updated_at` every thirty seconds while it owns a run.
+That lease matters while a run is waiting for the approval button or for an
+answer: no browser is being clicked during that time, but the runner is healthy.
+Only a run whose lease has been quiet for ten minutes is reclaimed.
+
+If the agent reaches the step ceiling, the fields it actually filled are still
+reported. A live run is not submitted in that case, because reaching the form
+is not the same thing as proving that all required fields are complete.
+
 ## The receipt
 
 `src/playground/confirmation.ts`. Its contents are read off the outcome rather
@@ -93,6 +102,11 @@ none.
 The policy sentence about visa and demographic questions only appears when a
 policy-refused field is actually in the list. Attached to a field the user
 merely chose to skip, it reads as Huntly refusing something it did not.
+
+If SMTP is not configured, the application/run outcome is still persisted and
+the UI says that the receipt was not sent; it does not pretend a message was
+delivered. Configure `SMTP_HOST` (and credentials when the relay requires them)
+in the deployment secret store to enable receipts.
 
 ## Running one
 

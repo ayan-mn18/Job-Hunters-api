@@ -125,6 +125,7 @@ export async function applyWithAgent(params: {
   // matches that list is recorded as blocked regardless.
   return {
     reached: result.submitted ? 'submitted' : result.reachedForm ? 'form' : 'nothing',
+    canSubmit: result.canSubmit,
     filled: result.filled
       .filter((label) => !sensitiveReason(label))
       .map((label) => ({ label, value: '[agent]' })),
