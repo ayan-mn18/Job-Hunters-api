@@ -70,6 +70,18 @@ place the deterministic tier checks them. This is not belt and braces: while
 testing locally, an API with `APPLY_DRY_RUN=false` handed a live run to a runner
 with it on, and only a cancel stopped it from submitting a real application.
 
+## When the runner dies
+
+`session.close()` sits in a `finally`, which covers every way a run can end
+except the process going away underneath it. Then nothing stops the hosted
+browser and it bills until its own timeout — which happened during development,
+after a runner was killed mid-run.
+
+`reconcileInterruptedPlaygroundRuns` runs on runner boot: any run still in a
+live status with a browser session attached has that browser stopped and the run
+marked failed. It is not resumed, because the browser it was driving is halfway
+through a form and nothing remembers where.
+
 ## The receipt
 
 `src/playground/confirmation.ts`. Its contents are read off the outcome rather

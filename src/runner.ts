@@ -15,6 +15,7 @@ import { send as sendOnLinkedIn } from './skills/linkedin/outreach.js'
 import { NoLinkedInSessionError, openLinkedInSession } from './skills/linkedin/session.js'
 import { sweepOutreachTargets } from './outreach/sweep.js'
 import { executePlaygroundRun } from './playground/run.js'
+import { reconcileInterruptedPlaygroundRuns } from './playground/reconcile.js'
 
 /**
  * The runner process: everything that needs a real browser.
@@ -47,6 +48,12 @@ registerQueueImplementations()
 // tested. It keeps them.
 startApplicationWorker()
 logger.info({ queue: QUEUE.apply, concurrency: env.RUNNER_APPLY_CONCURRENCY }, 'worker started')
+
+// A browser left behind by a killed runner is not stopped by anything else,
+// and bills until its own timeout.
+void reconcileInterruptedPlaygroundRuns().catch((error: unknown) => {
+  logger.error({ err: error }, 'could not reconcile interrupted playground runs')
+})
 
 void reconcileInterruptedApplications().catch((error: unknown) => {
   logger.error({ err: error }, 'could not reconcile interrupted applications in runner')
