@@ -57,6 +57,19 @@ losing the one answer somebody was asked for is the worst failure this has.
 a message typed while the run was still searching sits on the list and gets
 popped later as the approval to send an application.
 
+## Dry run, and who decides
+
+`dryRun` is written by the API when the run row is created; the runner is what
+actually presses submit. Those are separate processes with separate
+environments, so the run takes **the safer of the two** — a live run reaching a
+runner configured for dry runs stays dry, never the other way round — and the
+kill switch is honoured where the run starts.
+
+The agent's `submit` tool re-checks both immediately before the click, the same
+place the deterministic tier checks them. This is not belt and braces: while
+testing locally, an API with `APPLY_DRY_RUN=false` handed a live run to a runner
+with it on, and only a cancel stopped it from submitting a real application.
+
 ## The receipt
 
 `src/playground/confirmation.ts`. Its contents are read off the outcome rather
