@@ -115,7 +115,13 @@ Resources:
           export DEBIAN_FRONTEND=noninteractive
 
           apt-get update
-          apt-get install -y ca-certificates curl git gnupg jq nginx awscli snapd
+          apt-get install -y ca-certificates curl git gnupg jq nginx snapd unzip
+
+          if ! command -v aws >/dev/null 2>&1; then
+            curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            /tmp/aws/install
+          fi
 
           install -m 0755 -d /etc/apt/keyrings
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
@@ -206,6 +212,7 @@ Resources:
             git clone --branch "$BRANCH" --single-branch "$REPOSITORY" "$APP_DIR"
           fi
 
+          HOME=/root git config --global --add safe.directory "$APP_DIR"
           git -C "$APP_DIR" fetch --prune origin
           git -C "$APP_DIR" checkout --force "$BRANCH"
           git -C "$APP_DIR" reset --hard "origin/$BRANCH"
