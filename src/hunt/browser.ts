@@ -36,8 +36,8 @@ let warnedAboutFallback = false
  * changes with every Playwright bump, and fail with an unhelpful protocol
  * error when it drifts.
  */
-function automationExecutablePath(): string | undefined {
-  if (!env.PORTAL_AUTOMATION_ENABLED) {
+export function automationExecutablePath(options: { requireAutomation?: boolean } = {}): string | undefined {
+  if (options.requireAutomation !== false && !env.PORTAL_AUTOMATION_ENABLED) {
     throw serviceUnavailable('Portal automation is disabled. Set PORTAL_AUTOMATION_ENABLED=true.')
   }
   if (env.CHROMIUM_EXECUTABLE_PATH) return env.CHROMIUM_EXECUTABLE_PATH
@@ -66,12 +66,47 @@ function launchArgs(): string[] {
   return env.BROWSER_IN_CONTAINER ? CONTAINER_ARGS : []
 }
 
-export async function launchAutomationBrowser(): Promise<Browser> {
-  const executablePath = automationExecutablePath()
+/**
+ * A browser the agent tier can also drive.
+ *
+ * Stagehand attaches over CDP rather than sharing Playwright's connection, so
+ * the port has to be opened at launch. Passing one keeps a single browser for
+ * both tiers, which is what lets the live view and takeover keep working while
+ * an agent is the thing filling the form — a second, Stagehand-owned browser
+ * would be invisible to both.
+ */
+async function launchHeadlessBrowser(options: { cdpPort?: number; requireAutomation: boolean }): Promise<Browser> {
+  const executablePath = automationExecutablePath({ requireAutomation: options.requireAutomation })
+  const debugArgs = options?.cdpPort
+    ? [`--remote-debugging-port=${options.cdpPort}`, '--remote-allow-origins=*']
+    : []
   return chromium.launch({
     ...(executablePath ? { executablePath } : {}),
     headless: true,
-    args: launchArgs(),
+    args: [...launchArgs(), ...debugArgs],
+  })
+}
+
+export function launchAutomationBrowser(options?: { cdpPort?: number }): Promise<Browser> {
+  return launchHeadlessBrowser({ ...options, requireAutomation: true })
+}
+
+/** Renders local artifacts with the bundled browser without requiring portal automation. */
+export function launchHeadlessArtifactBrowser(): Promise<Browser> {
+  return launchHeadlessBrowser({ requireAutomation: false })
+}
+
+/** An ephemeral free port, so two concurrent applies never collide on CDP. */
+export async function freePort(): Promise<number> {
+  const net = await import('node:net')
+  return new Promise((resolve, reject) => {
+    const server = net.createServer()
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      const port = typeof address === 'object' && address ? address.port : 0
+      server.close(() => (port ? resolve(port) : reject(new Error('no free port'))))
+    })
   })
 }
 

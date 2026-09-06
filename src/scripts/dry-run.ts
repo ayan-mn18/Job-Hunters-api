@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { eq, sql } from 'drizzle-orm'
 import { closeDatabase, db } from '../db/client.js'
 import { jobs, users } from '../db/schema.js'
-import { launchAutomationBrowser } from '../hunt/browser.js'
+import { openSession } from '../browser/session.js'
 import { loadPortalProfile } from '../hunt/portal-profile.js'
 import { fillForm, submitForm } from '../hunt/apply/fill.js'
 import { downloadObject } from '../lib/storage.js'
@@ -46,7 +46,8 @@ const scratch = await mkdtemp(path.join(os.tmpdir(), 'huntly-dryrun-'))
 const resumePath = path.join(scratch, profile.baseResume.fileName)
 await writeFile(resumePath, await downloadObject(profile.baseResume.storagePath))
 
-const browser = await launchAutomationBrowser()
+const session = await openSession({ userId: user.id, label: 'dry-run' })
+if (session.liveUrl) console.log(`live: ${session.liveUrl}\n`)
 const report: Array<{
   ats: string
   company: string
@@ -76,7 +77,7 @@ try {
     for (const row of rows) {
       const url = row.applyUrl
       if (!url) continue
-      const page = await browser.newPage()
+      const page = await session.context.newPage()
       const started = Date.now()
       try {
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
@@ -162,7 +163,7 @@ try {
     }
   }
 } finally {
-  await browser.close().catch(() => undefined)
+  await session.close()
 }
 
 const submitted = report.filter((r) => r.submitted).length

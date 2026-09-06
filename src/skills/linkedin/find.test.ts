@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { levelDeltaFor, toProspect, type CandidateContext } from './find.js'
-import { scoreProspect } from './rank.js'
+import { scoreProspect } from '../../outreach/rank.js'
 
 const candidate: CandidateContext = {
   targetRole: 'Backend Engineer',

@@ -1,6 +1,6 @@
-import { and, desc, eq } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import { db } from '../db/client.js'
-import { huntSpecs, kits, resumes, userPortals, type User } from '../db/schema.js'
+import { huntSpecs, kits, userPortals, users, type User } from '../db/schema.js'
 import { toPeriodLabel } from '../lib/time.js'
 import type { Employment, Kit } from '../db/schema.js'
 
@@ -42,41 +42,74 @@ export interface UserDto {
  * together for the client.
  */
 export async function buildKitDraft(userId: string): Promise<Partial<KitDraftDto>> {
-  // These four reads are independent, and this function sits on the critical
-  // path of sign-in, sign-up and every token refresh. Run serially they cost
-  // four network round trips to the database; in parallel they cost one.
-  const [[kitRow], [specRow], connectedPortals, [baseResume]] = await Promise.all([
-    db.select().from(kits).where(eq(kits.userId, userId)).limit(1),
-    db.select().from(huntSpecs).where(eq(huntSpecs.userId, userId)).limit(1),
-    db
-      .select({ portalId: userPortals.portalId })
-      .from(userPortals)
-      .where(and(eq(userPortals.userId, userId), eq(userPortals.connected, true))),
-    db
-      .select({ fileName: resumes.fileName })
-      .from(resumes)
-      .where(and(eq(resumes.userId, userId), eq(resumes.isBase, true)))
-      .orderBy(desc(resumes.createdAt))
-      .limit(1),
-  ])
+  // This is on the critical path of sign-in, sign-up and every token refresh.
+  // The database is hosted remotely, so four parallel reads still consume a
+  // connection each and queue behind the pool under real traffic. Fold the
+  // independent reads into one indexed query and pay one network round trip.
+  const [row] = await db
+    .select({
+      roles: huntSpecs.roles,
+      locations: huntSpecs.locations,
+      companies: huntSpecs.dreamCompanies,
+      dailyTarget: huntSpecs.dailyTarget,
+      phone: kits.phone,
+      city: kits.city,
+      noticePeriod: kits.noticePeriod,
+      maxYearsExperience: kits.maxYearsExperience,
+      portals: sql<string[]>`coalesce(
+        array_agg(distinct ${userPortals.portalId})
+          filter (where ${userPortals.portalId} is not null),
+        '{}'
+      )`,
+      resumeName: sql<string | null>`(
+        select resume.file_name
+        from resumes as resume
+        where resume.user_id = ${users.id}
+          and resume.is_base = true
+        order by resume.created_at desc
+        limit 1
+      )`,
+    })
+    .from(users)
+    .leftJoin(kits, eq(kits.userId, users.id))
+    .leftJoin(huntSpecs, eq(huntSpecs.userId, users.id))
+    .leftJoin(
+      userPortals,
+      and(
+        eq(userPortals.userId, users.id),
+        eq(userPortals.connected, true),
+      ),
+    )
+    .where(eq(users.id, userId))
+    .groupBy(
+      users.id,
+      huntSpecs.roles,
+      huntSpecs.locations,
+      huntSpecs.dreamCompanies,
+      huntSpecs.dailyTarget,
+      kits.phone,
+      kits.city,
+      kits.noticePeriod,
+      kits.maxYearsExperience,
+    )
 
   const draft: Partial<KitDraftDto> = {}
 
-  if (specRow) {
-    draft.roles = specRow.roles.join(', ')
-    draft.locations = specRow.locations.join(', ')
-    draft.companies = specRow.dreamCompanies.join(', ')
-    draft.dailyTarget = specRow.dailyTarget
+  if (row?.roles) {
+    draft.roles = row.roles.join(', ')
+    draft.locations = row.locations?.join(', ') ?? ''
+    draft.companies = row.companies?.join(', ') ?? ''
+    draft.dailyTarget = row.dailyTarget ?? undefined
   }
-  draft.portals = connectedPortals.map((row) => row.portalId)
+  draft.portals = row?.portals ?? []
 
-  if (kitRow) {
-    draft.phone = kitRow.phone ?? ''
-    draft.city = kitRow.city ?? ''
-    draft.noticePeriod = kitRow.noticePeriod ?? ''
-    draft.maxYearsExperience = kitRow.maxYearsExperience
+  if (row) {
+    draft.phone = row.phone ?? ''
+    draft.city = row.city ?? ''
+    draft.noticePeriod = row.noticePeriod ?? ''
+    draft.maxYearsExperience = row.maxYearsExperience ?? 5
   }
-  draft.resumeName = baseResume?.fileName ?? ''
+  draft.resumeName = row?.resumeName ?? ''
 
   return draft
 }

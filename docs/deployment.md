@@ -132,6 +132,29 @@ region move.
 
 ## Browsers
 
+## Browsers
+
+`BROWSER_PROVIDER=browser-use` is the default and is what a deployed host
+should use. Browsers run on Browser Use and are driven over CDP by this
+project's own Playwright code — the same code as before, connected differently.
+What that buys: stealth, residential proxies, CAPTCHA solving, a per-user
+profile that keeps a login alive between runs, and a live URL a human can click
+in. The runner image no longer needs Chromium at all in this mode.
+
+Sessions bill at $0.02 per browser-hour with a one-minute minimum, and a
+session is **not** stopped by disconnecting from it. Everything that opens one
+goes through `withSession` or reaches `session.close()` in a `finally`; a leak
+is invisible until the invoice. `npm run browser:verify` opens a session, loads
+a page and asserts it reaches `stopped`.
+
+Managed proxy egress is $5/GB against $0.20/GB direct, so
+`BROWSER_USE_PROXY_COUNTRY` is empty by default and individual site skills opt
+in. Only LinkedIn does.
+
+`BROWSER_PROVIDER=local` keeps the old path for offline development.
+
+### The local provider
+
 `playwright-core` ships no browser. The runner image installs a matching one
 and `BROWSER_IN_CONTAINER=true` adds the flags Chromium needs to survive a
 container (`--no-sandbox`, `--disable-dev-shm-usage`). Leave
@@ -141,9 +164,17 @@ and hardcoding the path pins a build number that changes on every version bump.
 The base image tag in `Dockerfile.runner` must match the installed
 `playwright-core` version. Bump both in the same commit.
 
-Interactive sign-in (`AUTOMATION_HEADFUL=true`) opens a real window and so only
-works on a machine with a display. Connecting a LinkedIn account on a deployed
-host needs the live-view work — until then, connect locally.
+Interactive sign-in no longer needs a display. `POST /portal-accounts/:portal/connect`
+opens a hosted session on the user's profile and returns a `liveUrl`; the UI
+puts that in an iframe and the person signs in themselves.
+`POST /portal-accounts/:portal/connect/finish` stops the session, which is what
+writes the cookies back to the profile, and confirms the login by checking the
+profile's own cookie domains rather than by trusting what the page looked like.
+
+No password, one-time code or CAPTCHA is ever handled by this system.
+
+`AUTOMATION_HEADFUL=true` remains, and remains display-bound, but it now only
+applies to `BROWSER_PROVIDER=local`.
 
 ## Secrets
 

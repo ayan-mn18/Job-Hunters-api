@@ -1,0 +1,2 @@
+ALTER TABLE "email_accounts" DROP CONSTRAINT "email_accounts_user_id_address_pk";--> statement-breakpoint
+ALTER TABLE "email_accounts" ADD CONSTRAINT "email_accounts_user_id_pk" PRIMARY KEY("user_id");

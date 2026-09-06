@@ -62,7 +62,6 @@ async function search(query: SearchQuery, maxItems: number): Promise<JobStub[]> 
     results_per_page: String(Math.min(maxItems, 50)),
     what: query.keywords,
     max_days_old: '30',
-    content_type: 'application/json',
   })
   if (query.locationText && !query.remoteOnly) params.set('where', query.locationText)
 

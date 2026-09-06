@@ -1,3 +1,5 @@
+import { hasFirecrawl } from '../../config/env.js'
+import { skillsWith } from '../../skills/registry.js'
 import { DISCOVERY_ADAPTERS } from './adapters.js'
 import { adzunaMeta, adzunaSource } from './connectors/adzuna.js'
 import { googleJobsMeta, googleJobsSource } from './connectors/google-jobs.js'
@@ -46,10 +48,44 @@ function crawlConnectors(): JobConnector[] {
   })
 }
 
+/**
+ * Sources that come from a site skill.
+ *
+ * Work at a Startup is the first: its old adapter read the page directly and
+ * stopped working when the site began answering plain HTTP clients with 406,
+ * so it now reads through Firecrawl and lives with the rest of what this
+ * project knows about that site. Without a Firecrawl key it reports itself
+ * unavailable rather than contributing an empty list, which is what the old
+ * one silently did.
+ */
+function skillConnectors(): JobConnector[] {
+  return skillsWith('search').flatMap((skill): JobConnector[] => {
+    if (!skill.source) return []
+    const meta = CRAWL_META[skill.manifest.id] ?? {
+      tier: 2 as const,
+      markets: ['*'],
+      needsSession: false,
+      supports: { keyword: false, location: false },
+    }
+    return [
+      {
+        id: skill.manifest.id,
+        ...meta,
+        adapter: toDiscoveryAdapter(skill.source),
+        ...(hasFirecrawl ? {} : { unavailableReason: 'Needs a Firecrawl key to read this site.' }),
+      },
+    ]
+  })
+}
+
 export function allConnectors(): JobConnector[] {
+  const fromSkills = skillConnectors()
+  const skillIds = new Set(fromSkills.map((connector) => connector.id))
   return [
     ...SEARCH_CONNECTORS.map(({ meta, adapter }) => ({ ...meta, adapter })),
-    ...crawlConnectors(),
+    // A skill's source wins over a legacy adapter with the same id.
+    ...crawlConnectors().filter((connector) => !skillIds.has(connector.id)),
+    ...fromSkills,
   ]
 }
 

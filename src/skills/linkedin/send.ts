@@ -1,7 +1,7 @@
 import type { BrowserContext, Page } from 'playwright-core'
-import { logger } from '../lib/logger.js'
-import { INVITE_LIMIT } from './compose.js'
-import type { SendableMessage } from './sequence.js'
+import { logger } from '../../lib/logger.js'
+import { INVITE_LIMIT } from '../../outreach/compose.js'
+import type { SendableMessage } from '../../outreach/sequence.js'
 
 /**
  * Actually sending, in the user's own LinkedIn session.

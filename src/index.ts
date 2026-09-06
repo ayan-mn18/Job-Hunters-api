@@ -45,7 +45,10 @@ const server: Server = app.listen(env.PORT, () => {
         return
       }
       // Pay the connection handshakes now, while nobody is waiting on them.
-      const opened = await warmPool()
+      // The UI opens several authenticated reads in parallel on page load.
+      // Warm the full API share so those requests reuse established sessions
+      // instead of paying a remote TLS/auth handshake for the extra clients.
+      const opened = await warmPool(env.DATABASE_POOL_MAX)
       logger.info({ connections: opened }, 'connected to postgres')
     })
   }

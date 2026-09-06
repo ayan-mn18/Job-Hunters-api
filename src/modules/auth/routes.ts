@@ -10,6 +10,7 @@ import { eq } from 'drizzle-orm'
 import { unauthorized } from '../../lib/errors.js'
 import {
   changePasswordSchema,
+  googleCallbackSchema,
   logoutSchema,
   refreshSchema,
   signInSchema,
@@ -17,11 +18,13 @@ import {
 } from './schemas.js'
 import {
   changePassword,
+  completeGoogleSignIn,
   refreshSession,
   revokeAllForUser,
   revokeRefreshToken,
   signIn,
   signUp,
+  startGoogleSignIn,
 } from './service.js'
 
 export const authRouter: Router = Router()
@@ -56,6 +59,27 @@ authRouter.post(
   validate({ body: signInSchema }),
   asyncHandler(async (req, res) => {
     const session = await signIn(req.body, {
+      userAgent: req.get('user-agent'),
+      ipAddress: req.ip,
+    })
+    ok(res, session)
+  }),
+)
+
+authRouter.post(
+  '/google/start',
+  authLimiter,
+  asyncHandler(async (_req, res) => {
+    ok(res, { authorizeUrl: startGoogleSignIn() })
+  }),
+)
+
+authRouter.post(
+  '/google/callback',
+  authLimiter,
+  validate({ body: googleCallbackSchema }),
+  asyncHandler(async (req, res) => {
+    const session = await completeGoogleSignIn(req.body.code, req.body.state, {
       userAgent: req.get('user-agent'),
       ipAddress: req.ip,
     })

@@ -19,7 +19,12 @@ Three processes, one codebase. See [docs/deployment.md](docs/deployment.md).
 |---|---|---|
 | `api` | `npm run dev` | HTTP only. Never launches a browser, never runs a job. |
 | `worker` | `npm run worker:dev` | Discovery, ranking, inbox, schedules. No browser. |
-| `runner` | `npm run runner:dev` | Everything needing Chromium: applying, LinkedIn, outreach. |
+| `runner` | `npm run runner:dev` | Everything needing a browser: applying, LinkedIn, outreach. |
+
+Browsers are hosted by default (`BROWSER_PROVIDER=browser-use`) and driven over
+CDP by this project's own Playwright code, so the runner image no longer needs
+Chromium of its own. Muse Spark reasons everywhere; Firecrawl reads every page
+that needs no login.
 
 ## What it does
 
@@ -36,6 +41,11 @@ change which jobs the user sees. Median five questions, hard cap seven.
 A state machine per attempt, watchable live over a WebSocket, with takeover
 when it gets stuck. Portal recipes first, heuristics second, a model last —
 and every answer it learns is cached so the next person never waits for it.
+
+**Site skills** — [docs/skills.md](docs/skills.md)
+Everything known about one website — where it may navigate, whether it needs a
+signed-in profile, how to list its postings, how to complete its application —
+in one directory. Adding a site is adding a directory.
 
 **Referrals, inbound** — [docs/referrals.md](docs/referrals.md)
 Sweeps the user's LinkedIn threads for people asking *them* for a referral,
@@ -83,10 +93,20 @@ codebase: see [docs/adding-a-source.md](docs/adding-a-source.md).
 ## Development
 
 ```bash
-npm test          # 164 tests, no network
+npm test          # 198 tests, no network
 npm run typecheck
 npm run db:generate   # after editing src/db/schema.ts
+npm run skills:check  # every site skill's manifest and playbook
 ```
 
 Tests never touch the network or a real browser. Anything that would is behind
 an interface with a deterministic fallback.
+
+These four do use the network, and cost a little, so they are run by hand:
+
+```bash
+npm run browser:verify              # opens a hosted browser and proves it stops
+npm run skills:source workatastartup 5   # runs one skill's source for real
+npm run agent:verify <apply-url>    # drives a real form, dry run, submits nothing
+npm run apply:dry-run <email>       # the deterministic ladder against live ATS forms
+```

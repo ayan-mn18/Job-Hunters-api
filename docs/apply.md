@@ -52,6 +52,43 @@ question, not a field name — and a live GitLab form proved why, by matching
 "current employer" inside *"Are you subject to any employment agreements
 and/or restrictive covenants with your current employer?"*.
 
+## The agent tier
+
+The ladder handles the forms it knows: Greenhouse filled 23 fields in seconds
+for nothing. The agent exists for what the ladder cannot reach at all — an
+aggregator listing with no form on it, a portal with no recipe, a multi-step
+flow that needs a link followed before a form appears. It runs *after* the
+ladder, never instead of it, and a failed agent never loses the ladder's work.
+
+Muse Spark decides each step and Playwright performs it (`src/agent/`). One
+observation, one tool call, one action, repeat — bounded per step and overall.
+An earlier version handed the model a paragraph-long goal and asked it to plan;
+it sat inside a single call for over half an hour on a live run.
+
+What the model sees is text, not pictures: every interactive element, numbered,
+with the label a person would read. A screenshot is thousands of tokens and a
+form is a few hundred, so images are attached only when the element list is
+empty or the last action changed nothing. Numbering is stamped into the DOM
+(`data-huntly-ref`) and re-stamped every observation, because between observing
+and acting the page may have re-rendered.
+
+Three rules are enforced in `src/agent/tools.ts`, on the arguments the model
+actually passed, rather than asked for in a prompt:
+
+- navigation is confined to the skill's `allowedDomains`, and a click that
+  lands off them goes back;
+- every write is checked against the same never-auto list below;
+- in a dry run the submit tool is **absent from the tool list**, and refused
+  again in the executor if the model invents it.
+
+This replaced Stagehand, which could only reason with providers on its own
+list, needed a browser extension Chromium would not load headlessly — so it ran
+a second, invisible browser and the live view went dark for the whole agent
+phase — and bundled a zod major version this project does not use.
+
+Site-specific behaviour lives in a site skill rather than here. See
+[skills.md](skills.md).
+
 ## What is never answered
 
 Demographics, salary expectations, visa status, criminal history, references'
@@ -108,11 +145,16 @@ without that check any authenticated user could watch anyone's application.
 The token rides as a query parameter because a browser WebSocket cannot set an
 Authorization header.
 
-Frames come from CDP's own screencast rather than a screenshot loop: Chrome
-pushes one when the page changes, so an idle form costs nothing. They are
-paced to about five a second and **only produced while somebody is watching** —
-the gateway maintains a Redis key while a socket is open, and the runner checks
-it before starting.
+With the hosted browser provider there are no frames at all: the session
+publishes its own `liveUrl`, stored on the attempt, and the UI embeds it. That
+is the real browser, so watching and taking over are the same act and there is
+no coordinate mapping to get wrong.
+
+Frame streaming remains for `BROWSER_PROVIDER=local`. Frames come from CDP's own
+screencast rather than a screenshot loop: Chrome pushes one when the page
+changes, so an idle form costs nothing. They are paced to about five a second
+and **only produced while somebody is watching** — the gateway maintains a
+Redis key while a socket is open, and the runner checks it before starting.
 
 ### Takeover
 

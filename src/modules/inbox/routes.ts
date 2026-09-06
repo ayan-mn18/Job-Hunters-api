@@ -7,7 +7,7 @@ import { db } from '../../db/client.js'
 import { emailAccounts, userSchedules } from '../../db/schema.js'
 import { badRequest, serviceUnavailable } from '../../lib/errors.js'
 import { asyncHandler, ok } from '../../lib/http.js'
-import { encryptCredential } from '../../lib/credential-vault.js'
+import { decryptCredential, encryptCredential } from '../../lib/credential-vault.js'
 import { request } from '../../hunt/discovery/fetcher.js'
 import { currentUser, requireAuth } from '../../middleware/auth.js'
 import { validate } from '../../middleware/validate.js'
@@ -24,6 +24,10 @@ inboxRouter.use(requireAuth)
  * someone connect their inbox in the first place.
  */
 const SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+
+function gmailRedirect(): string | undefined {
+  return env.GOOGLE_GMAIL_REDIRECT ?? env.GOOGLE_OAUTH_REDIRECT
+}
 
 /** Short-lived, single-use, and bound to the user who started the flow. */
 const pendingStates = new Map<string, { userId: string; at: number }>()
@@ -69,7 +73,7 @@ inboxRouter.post(
   '/gmail/connect',
   asyncHandler(async (req, res) => {
     const auth = currentUser(req)
-    if (!hasGmail || !env.GOOGLE_CLIENT_ID || !env.GOOGLE_OAUTH_REDIRECT) {
+    if (!hasGmail || !env.GOOGLE_CLIENT_ID || !gmailRedirect()) {
       throw serviceUnavailable(
         'Gmail is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT.',
       )
@@ -81,7 +85,7 @@ inboxRouter.post(
 
     const url = new URL('https://accounts.google.com/o/oauth2/v2/auth')
     url.searchParams.set('client_id', env.GOOGLE_CLIENT_ID)
-    url.searchParams.set('redirect_uri', env.GOOGLE_OAUTH_REDIRECT)
+    url.searchParams.set('redirect_uri', gmailRedirect()!)
     url.searchParams.set('response_type', 'code')
     url.searchParams.set('scope', SCOPES.join(' '))
     // Without both of these Google returns no refresh token on a repeat
@@ -106,41 +110,73 @@ inboxRouter.post(
     if (!pending || pending.userId !== auth.id) {
       throw badRequest('That sign-in link has expired. Start again from Notifications.')
     }
-    if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.GOOGLE_OAUTH_REDIRECT) {
+    if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !gmailRedirect()) {
       throw serviceUnavailable('Gmail is not configured.')
     }
 
-    const tokenResponse = await request('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      skipRobots: true,
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id: env.GOOGLE_CLIENT_ID,
-        client_secret: env.GOOGLE_CLIENT_SECRET,
-        redirect_uri: env.GOOGLE_OAUTH_REDIRECT,
-        grant_type: 'authorization_code',
-        code,
-      }).toString(),
-    })
+    let tokenResponse: Response
+    try {
+      tokenResponse = await request('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        skipRobots: true,
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: env.GOOGLE_CLIENT_ID,
+          client_secret: env.GOOGLE_CLIENT_SECRET,
+          redirect_uri: gmailRedirect()!,
+          grant_type: 'authorization_code',
+          code,
+        }).toString(),
+      })
+    } catch {
+      throw badRequest('Google rejected the Gmail connection. Check the OAuth redirect URI and try again.')
+    }
     const tokens = (await tokenResponse.json()) as {
       refresh_token?: string
       access_token?: string
     }
-    if (!tokens.refresh_token) {
+    if (!tokens.access_token) {
+      throw badRequest('Google did not return an access token for Gmail.')
+    }
+
+    // Google may omit refresh_token when the user already granted this client
+    // access. Reuse the encrypted credential on a reconnect instead of
+    // discarding a working mailbox connection.
+    const [existingAccount] = await db
+      .select({ encryptedCredentials: emailAccounts.encryptedCredentials })
+      .from(emailAccounts)
+      .where(eq(emailAccounts.userId, auth.id))
+      .limit(1)
+    let refreshToken = tokens.refresh_token
+    if (!refreshToken && existingAccount?.encryptedCredentials) {
+      try {
+        refreshToken = (
+          await decryptCredential<{ refreshToken?: string }>(auth.id, existingAccount.encryptedCredentials)
+        ).refreshToken
+      } catch {
+        refreshToken = undefined
+      }
+    }
+    if (!refreshToken) {
       throw badRequest(
         'Google did not return a refresh token. Remove Huntly from your Google account permissions and connect again.',
       )
     }
 
-    const profileResponse = await request('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
-      skipRobots: true,
-      headers: { authorization: `Bearer ${tokens.access_token ?? ''}` },
-    })
+    let profileResponse: Response
+    try {
+      profileResponse = await request('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
+        skipRobots: true,
+        headers: { authorization: `Bearer ${tokens.access_token}` },
+      })
+    } catch {
+      throw badRequest('Google did not return a Gmail profile for this account.')
+    }
     const profile = (await profileResponse.json()) as { emailAddress?: string }
 
     const encryptedCredentials = await encryptCredential(auth.id, {
       kind: 'gmail-oauth',
-      refreshToken: tokens.refresh_token,
+      refreshToken,
     })
 
     await db

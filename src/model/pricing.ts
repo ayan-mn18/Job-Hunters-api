@@ -2,7 +2,7 @@
  * Published per-million-token rates, used to turn a token count into a number
  * we can put in front of a user.
  *
- * These are Anthropic first-party API rates and they change. The value stored
+ * These are first-party API rates and they change. The value stored
  * on the `model_usage` row is what this table said at the time of the call, so
  * a later price change does not silently rewrite history — and an unknown
  * model bills as zero rather than guessing, which shows up as a suspiciously
@@ -26,6 +26,10 @@ const RATES: Record<string, Rate> = {
   'claude-sonnet-5': { input: 2, output: 10 },
   'claude-sonnet-4-6': { input: 3, output: 15 },
   'claude-haiku-4-5': { input: 1, output: 5 },
+  // Meta Model API, used by the agentic apply tier. Reasoning tokens bill at
+  // the output rate, and this model spends most of its budget on them.
+  'muse-spark-1.3': { input: 0.1, output: 0.2 },
+  'muse-spark-1.3-contributor': { input: 0.1, output: 0.2 },
 }
 
 /** Cache reads bill at roughly a tenth of the normal input rate. */

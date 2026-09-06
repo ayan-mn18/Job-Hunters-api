@@ -65,10 +65,11 @@ export const db = new Proxy({} as NodePgDatabase<typeof schema>, {
 })
 
 /**
- * Opens a few connections at boot so the first real request does not pay for
- * the handshake. Failures are logged and swallowed: a database that is not
- * reachable yet must not stop the process from starting and reporting that on
- * `/healthz`.
+ * Opens connections at boot so the first real requests do not pay for the
+ * handshake. The API passes its full pool share here because the SPA starts
+ * several reads in parallel; the smaller default remains useful for scripts.
+ * Failures are logged and swallowed: a database that is not reachable yet
+ * must not stop the process from starting and reporting that on `/healthz`.
  */
 export async function warmPool(connections = 3): Promise<number> {
   if (!hasDatabase) return 0

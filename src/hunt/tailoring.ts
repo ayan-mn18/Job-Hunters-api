@@ -1,12 +1,11 @@
 import crypto from 'node:crypto'
 import { and, eq } from 'drizzle-orm'
-import { chromium } from 'playwright-core'
 import { extractText } from 'unpdf'
-import { env } from '../config/env.js'
 import { db } from '../db/client.js'
 import { huntCandidates, huntRunJobs, jobs, resumeVariants, resumes } from '../db/schema.js'
 import { badRequest, notFound } from '../lib/errors.js'
 import { buildObjectKey, downloadObject, uploadObject } from '../lib/storage.js'
+import { launchHeadlessArtifactBrowser } from './browser.js'
 import { keywordTokens } from './discovery/normalise.js'
 import { resumeDocumentSchema, type ResumeDocument } from './resume-document.js'
 
@@ -90,10 +89,7 @@ function renderHtml(document: ResumeDocument, plan: TailoringPlan): string {
 }
 
 async function renderPdf(document: ResumeDocument, plan: TailoringPlan): Promise<Buffer> {
-  const executablePath = env.CHROMIUM_EXECUTABLE_PATH
-    ?? (process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : undefined)
-  if (!executablePath) throw badRequest('CHROMIUM_EXECUTABLE_PATH is required to tailor resumes.')
-  const browser = await chromium.launch({ executablePath, headless: true })
+  const browser = await launchHeadlessArtifactBrowser()
   try {
     const page = await browser.newPage()
     await page.setContent(renderHtml(document, plan), { waitUntil: 'load' })

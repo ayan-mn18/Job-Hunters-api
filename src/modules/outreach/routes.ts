@@ -13,7 +13,7 @@ import { asyncHandler, created, ok, pathParam } from '../../lib/http.js'
 import { currentUser, requireAuth } from '../../middleware/auth.js'
 import { validate } from '../../middleware/validate.js'
 import { DEFAULT_LIMITS, NEVER_AUTOMATED } from '../../outreach/limits.js'
-import { acceptanceRate, loadHealth, nextSendable } from '../../outreach/sequence.js'
+import { acceptanceRate, loadHealth, nextSendable, sentCounts } from '../../outreach/sequence.js'
 
 export const outreachRouter: Router = Router()
 outreachRouter.use(requireAuth)
@@ -229,16 +229,21 @@ outreachRouter.get(
   '/health',
   asyncHandler(async (req, res) => {
     const auth = currentUser(req)
-    const [health, rate, sendable, schedule] = await Promise.all([
+    const [health, rate, counts, schedule] = await Promise.all([
       loadHealth(auth.id),
       acceptanceRate(auth.id),
-      nextSendable(auth.id),
+      sentCounts(auth.id),
       db
         .select({ enabled: userSchedules.outreachEnabled, timezone: userSchedules.timezone })
         .from(userSchedules)
         .where(eq(userSchedules.userId, auth.id))
         .limit(1),
     ])
+    const sendable = await nextSendable(auth.id, {
+      health,
+      counts,
+      schedule: schedule[0],
+    })
 
     const paused = health.pausedUntil !== null && health.pausedUntil.getTime() > Date.now()
 

@@ -17,8 +17,6 @@ services:
     command: redis-server --appendonly yes
     volumes:
       - redis-data:/data
-    ports:
-      - '6379:6379'
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 5s
@@ -40,7 +38,7 @@ services:
       # the largest share.
       DATABASE_POOL_MAX: 6
     ports:
-      - '46460:46460'
+      - '127.0.0.1:46460:46460'
     depends_on:
       redis:
         condition: service_healthy
@@ -69,6 +67,7 @@ services:
       NODE_ENV: production
       REDIS_URL: redis://redis:6379
       PORTAL_AUTOMATION_ENABLED: 'true'
+      RUNNER_APPLY_CONCURRENCY: 1
       # The runner is browser-bound, not query-bound. It needs very few.
       DATABASE_POOL_MAX: 3
     # Chromium crashes on heavy pages with the default 64 MB /dev/shm. The

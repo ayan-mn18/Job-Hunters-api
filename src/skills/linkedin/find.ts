@@ -1,8 +1,8 @@
 import type { BrowserContext, Page } from 'playwright-core'
-import { logger } from '../lib/logger.js'
-import { classifyRole } from '../hunt/role-filter.js'
+import { logger } from '../../lib/logger.js'
+import { classifyRole } from '../../hunt/role-filter.js'
 import { CheckpointError } from './send.js'
-import type { Prospect, Relationship } from './rank.js'
+import type { Prospect, Relationship } from '../../outreach/rank.js'
 
 /**
  * Finding people who could refer you.

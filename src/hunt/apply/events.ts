@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events'
 import { getRedis } from '../../lib/redis.js'
 import { logger } from '../../lib/logger.js'
 import { hasRedis } from '../../config/env.js'
+import type { Rung } from './fields.js'
 
 /**
  * Attempt events, from the runner to whoever is watching.
@@ -38,7 +39,8 @@ export interface AttemptFieldEvent {
   attemptId: string
   label: string
   /** How it was resolved: which rung of the ladder answered. */
-  via: 'recipe' | 'heuristic' | 'cache' | 'model' | 'skipped'
+  // Was a second copy of this union and had already drifted from it.
+  via: Rung
   /** Never the value itself — a form field can hold a phone number. */
   filled: boolean
 }

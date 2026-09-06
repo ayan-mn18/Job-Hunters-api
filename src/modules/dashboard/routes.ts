@@ -5,13 +5,11 @@ import { db } from '../../db/client.js'
 import {
   activityEvents,
   applications,
-  huntSpecs,
   huntCandidates,
   huntRunJobs,
   huntRuns,
   jobSources,
   jobs,
-  referrals,
   userPortals,
 } from '../../db/schema.js'
 import { notFound } from '../../lib/errors.js'
@@ -132,55 +130,73 @@ dashboardRouter.get(
 
     // "Today" means today in APP_TIMEZONE, not UTC — otherwise the counter
     // resets at 05:30 IST and the user watches their progress vanish.
-    const appliedLocalDate = localDate(applications.appliedAt)
-    const today = todayLocal()
     const appliedDayKey = localDateKey(applications.appliedAt)
 
-    const [
-      [appliedTodayRow],
-      statusCounts,
-      [portalRow],
-      [pendingReferralRow],
-      [referralsTodayRow],
-      activeDays,
-      recentApplications,
-      activity,
-      [specRow],
-    ] = await Promise.all([
-      db
-        .select({ value: count() })
-        .from(applications)
-        .where(and(eq(applications.userId, auth.id), sql`${appliedLocalDate} = ${today}`)),
+    type DashboardSummary = {
+      applied_today: number
+      status_counts: Record<string, number>
+      jobs_found: number
+      portals_connected: number
+      pending_referrals: number
+      referrals_today: number
+      daily_target: number | null
+    }
 
-      db
-        .select({ status: applications.status, value: count() })
-        .from(applications)
-        .where(eq(applications.userId, auth.id))
-        .groupBy(applications.status),
-
-      db
-        .select({
-          jobsFound: sql<number>`coalesce(sum(${userPortals.jobsFound}), 0)::int`,
-          connected: sql<number>`count(*)::int`,
-        })
-        .from(userPortals)
-        .where(and(eq(userPortals.userId, auth.id), eq(userPortals.connected, true))),
-
-      db
-        .select({ value: count() })
-        .from(referrals)
-        .where(and(eq(referrals.userId, auth.id), eq(referrals.handled, false))),
-
-      db
-        .select({ value: count() })
-        .from(referrals)
-        .where(
-          and(
-            eq(referrals.userId, auth.id),
-            sql`${localDate(referrals.receivedAt)} = ${today}`,
-          ),
-        ),
-
+    // The Den used to make nine independent database round trips. They were
+    // launched together, but the pool has six connections and the database is
+    // remote, so the request still took multiple network waves. Keep the two
+    // lists separate, but fold all counters into one database call.
+    const [summaryRows, activeDays, recentApplications, activity] = await Promise.all([
+      db.execute(
+        sql<DashboardSummary>`
+          select
+            coalesce((
+              select count(*)::int
+              from ${applications}
+              where ${applications.userId} = ${auth.id}
+                and ${localDate(applications.appliedAt)} = ${todayLocal()}
+            ), 0)::int as applied_today,
+            coalesce((
+              select json_object_agg(status, value)
+              from (
+                select ${applications.status} as status, count(*)::int as value
+                from ${applications}
+                where ${applications.userId} = ${auth.id}
+                group by ${applications.status}
+              ) as status_counts
+            ), '{}'::json)::json as status_counts,
+            coalesce((
+              select sum(${userPortals.jobsFound})::int
+              from ${userPortals}
+              where ${userPortals.userId} = ${auth.id}
+                and ${userPortals.connected} = true
+            ), 0)::int as jobs_found,
+            (
+              select count(*)::int
+              from ${userPortals}
+              where ${userPortals.userId} = ${auth.id}
+                and ${userPortals.connected} = true
+            ) as portals_connected,
+            (
+              select count(*)::int
+              from referrals
+              where user_id = ${auth.id}
+                and handled = false
+            ) as pending_referrals,
+            (
+              select count(*)::int
+              from referrals
+              where user_id = ${auth.id}
+                and ${localDate(sql.raw('referrals.received_at'))} = ${todayLocal()}
+            ) as referrals_today,
+            (
+              select daily_target
+              from hunt_specs
+              where user_id = ${auth.id}
+              limit 1
+            ) as daily_target
+        `,
+      ),
       // Distinct days with at least one application — the streak input.
       db
         .selectDistinct({
@@ -204,9 +220,9 @@ dashboardRouter.get(
         .where(eq(activityEvents.userId, auth.id))
         .orderBy(desc(activityEvents.createdAt))
         .limit(query.activityLimit),
-
-      db.select().from(huntSpecs).where(eq(huntSpecs.userId, auth.id)).limit(1),
     ])
+
+    const summary = summaryRows.rows[0] as DashboardSummary | undefined
 
     const counts: Record<string, number> = {
       queued: 0,
@@ -215,11 +231,13 @@ dashboardRouter.get(
       interview: 0,
       rejected: 0,
     }
-    for (const row of statusCounts) counts[row.status] = row.value
+    for (const [status, value] of Object.entries(summary?.status_counts ?? {})) {
+      counts[status] = Number(value)
+    }
 
     const totalApplications = Object.values(counts).reduce((a, b) => a + b, 0)
-    const appliedToday = appliedTodayRow?.value ?? 0
-    const dailyTarget = specRow?.dailyTarget ?? 50
+    const appliedToday = Number(summary?.applied_today ?? 0)
+    const dailyTarget = Number(summary?.daily_target ?? 50)
 
     const now = new Date()
 
@@ -239,14 +257,14 @@ dashboardRouter.get(
       stats: {
         appliedToday,
         totalApplications,
-        jobsScraped: portalRow?.jobsFound ?? 0,
-        portalsConnected: portalRow?.connected ?? 0,
+        jobsScraped: Number(summary?.jobs_found ?? 0),
+        portalsConnected: Number(summary?.portals_connected ?? 0),
         interviews: counts.interview ?? 0,
         viewed: counts.viewed ?? 0,
         queued: counts.queued ?? 0,
         rejected: counts.rejected ?? 0,
-        referralsWaiting: pendingReferralRow?.value ?? 0,
-        referralsToday: referralsTodayRow?.value ?? 0,
+        referralsWaiting: Number(summary?.pending_referrals ?? 0),
+        referralsToday: Number(summary?.referrals_today ?? 0),
       },
       recentApplications: recentApplications.map((row) => ({
         id: row.id,

@@ -8,6 +8,7 @@ import { globalLimiter } from './middleware/rateLimit.js'
 import { httpLogger, requestId, responseTime } from './middleware/requestId.js'
 import { applicationsRouter } from './modules/applications/routes.js'
 import { authRouter } from './modules/auth/routes.js'
+import { billingRouter } from './modules/billing/routes.js'
 import { dashboardRouter } from './modules/dashboard/routes.js'
 import { healthRouter } from './modules/health/routes.js'
 import { huntRouter } from './modules/hunt/routes.js'
@@ -69,6 +70,9 @@ export function createApp(): Express {
     }),
   )
 
+  // Dodo signs the raw webhook bytes. This route-specific parser must run
+  // before express.json consumes the body for every other endpoint.
+  app.use('/billing/dodo/webhook', express.raw({ type: '*/*', limit: '1mb' }))
   app.use(express.json({ limit: '1mb' }))
   app.use(express.urlencoded({ extended: true, limit: '1mb' }))
 
@@ -86,6 +90,7 @@ export function createApp(): Express {
   })
 
   app.use('/auth', authRouter)
+  app.use('/billing', billingRouter)
   app.use('/me', meRouter)
   app.use('/resumes', resumesRouter)
   app.use('/portals', portalsRouter)

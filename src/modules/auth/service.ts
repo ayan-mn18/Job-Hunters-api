@@ -1,7 +1,8 @@
+import crypto from 'node:crypto'
 import { and, eq, isNull, lt, or } from 'drizzle-orm'
 import { db } from '../../db/client.js'
 import { huntSpecs, kits, refreshTokens, users, type User } from '../../db/schema.js'
-import { conflict, unauthorized } from '../../lib/errors.js'
+import { badRequest, conflict, serviceUnavailable, unauthorized } from '../../lib/errors.js'
 import {
   accessTokenExpiresInSeconds,
   expiryFromDuration,
@@ -12,7 +13,7 @@ import {
 } from '../../lib/jwt.js'
 import { logger } from '../../lib/logger.js'
 import { fakeVerify, hashPassword, verifyPassword } from '../../lib/password.js'
-import { env } from '../../config/env.js'
+import { env, hasGoogleAuth } from '../../config/env.js'
 import { recordActivity } from '../../services/activity.js'
 import { serializeUserWithKit, type UserDto } from '../../serializers/user.js'
 import type { SignInInput, SignUpInput } from './schemas.js'
@@ -37,6 +38,177 @@ const AVATARS = ['🧑‍🚀', '🦝', '🐼', '🦊', '🐙', '🦉', '🐝', 
 export function avatarFor(email: string): string {
   const sum = [...email].reduce((total, char) => total + char.charCodeAt(0), 0)
   return AVATARS[sum % AVATARS.length]!
+}
+
+/* ------------------------------------------------------------ Google login */
+
+/** Short-lived, single-use login states. The state never contains user data. */
+const pendingGoogleStates = new Map<string, { at: number }>()
+
+function sweepGoogleStates(): void {
+  const cutoff = Date.now() - 10 * 60_000
+  for (const [state, entry] of pendingGoogleStates) {
+    if (entry.at < cutoff) pendingGoogleStates.delete(state)
+  }
+}
+
+export function startGoogleSignIn(): string {
+  if (!hasGoogleAuth || !env.GOOGLE_CLIENT_ID || !env.GOOGLE_AUTH_REDIRECT) {
+    throw serviceUnavailable(
+      'Google login is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_AUTH_REDIRECT.',
+    )
+  }
+
+  sweepGoogleStates()
+  const state = crypto.randomBytes(24).toString('base64url')
+  pendingGoogleStates.set(state, { at: Date.now() })
+
+  const url = new URL('https://accounts.google.com/o/oauth2/v2/auth')
+  url.searchParams.set('client_id', env.GOOGLE_CLIENT_ID)
+  url.searchParams.set('redirect_uri', env.GOOGLE_AUTH_REDIRECT)
+  url.searchParams.set('response_type', 'code')
+  url.searchParams.set('scope', 'openid email profile')
+  url.searchParams.set('state', state)
+  url.searchParams.set('access_type', 'offline')
+  url.searchParams.set('prompt', 'select_account')
+  return url.toString()
+}
+
+interface GoogleTokens {
+  access_token?: string
+  id_token?: string
+}
+
+interface GoogleProfile {
+  sub?: string
+  email?: string
+  email_verified?: boolean
+  name?: string
+}
+
+async function googleJson<T>(url: string, init: RequestInit): Promise<T> {
+  let response: Response
+  try {
+    response = await fetch(url, { ...init, signal: AbortSignal.timeout(15_000) })
+  } catch {
+    throw serviceUnavailable('Google is not reachable right now. Try again in a moment.')
+  }
+
+  const raw = await response.text()
+  if (!response.ok) {
+    throw badRequest('Google could not complete sign-in. Try again.')
+  }
+  try {
+    return JSON.parse(raw) as T
+  } catch {
+    throw badRequest('Google returned an invalid sign-in response.')
+  }
+}
+
+export async function completeGoogleSignIn(
+  code: string,
+  state: string,
+  context: RequestContext,
+): Promise<AuthSession> {
+  const pending = pendingGoogleStates.get(state)
+  pendingGoogleStates.delete(state)
+  if (!pending || pending.at < Date.now() - 10 * 60_000) {
+    throw badRequest('That Google sign-in link has expired. Start again.')
+  }
+  if (!hasGoogleAuth || !env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.GOOGLE_AUTH_REDIRECT) {
+    throw serviceUnavailable('Google login is not configured.')
+  }
+
+  const tokens = await googleJson<GoogleTokens>('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: env.GOOGLE_CLIENT_ID,
+      client_secret: env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: env.GOOGLE_AUTH_REDIRECT,
+      grant_type: 'authorization_code',
+      code,
+    }).toString(),
+  })
+  if (!tokens.access_token) throw badRequest('Google did not return an access token.')
+
+  // The userinfo response is bound to the exchanged access token. When Google
+  // returns an ID token as well, tokeninfo gives us an explicit audience check
+  // without bringing a second JWT library into the API.
+  if (tokens.id_token) {
+    const tokenInfo = await googleJson<{ aud?: string; iss?: string }>(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(tokens.id_token)}`,
+      { method: 'GET' },
+    )
+    if (tokenInfo.aud !== env.GOOGLE_CLIENT_ID || (tokenInfo.iss && !['accounts.google.com', 'https://accounts.google.com'].includes(tokenInfo.iss))) {
+      throw badRequest('Google returned an invalid identity token.')
+    }
+  }
+
+  const profile = await googleJson<GoogleProfile>('https://openidconnect.googleapis.com/v1/userinfo', {
+    method: 'GET',
+    headers: { authorization: `Bearer ${tokens.access_token}` },
+  })
+  const email = profile.email?.trim().toLowerCase()
+  if (!profile.sub || !email || profile.email_verified !== true) {
+    throw badRequest('Google did not provide a verified email address.')
+  }
+
+  const [byGoogleSubject] = await db
+    .select()
+    .from(users)
+    .where(eq(users.googleSubject, profile.sub))
+    .limit(1)
+  const [byEmail] = await db.select().from(users).where(eq(users.email, email)).limit(1)
+  if (byGoogleSubject && byEmail && byGoogleSubject.id !== byEmail.id) {
+    throw conflict('That Google account is already linked to another Huntly account.')
+  }
+
+  let user = byGoogleSubject ?? byEmail
+  let created = false
+  if (!user) {
+    const passwordHash = await hashPassword(crypto.randomBytes(32).toString('base64url'))
+    user = await db.transaction(async (tx) => {
+      const [row] = await tx
+        .insert(users)
+        .values({
+          email,
+          googleSubject: profile.sub,
+          passwordHash,
+          name: profile.name?.trim() || email.split('@')[0] || 'Huntly user',
+          avatar: avatarFor(email),
+          onboarded: false,
+        })
+        .returning()
+      if (!row) throw new Error('Insert returned no user')
+      await tx.insert(kits).values({ userId: row.id, fullName: row.name, email: row.email })
+      await tx.insert(huntSpecs).values({ userId: row.id })
+      return row
+    })
+    created = true
+  } else {
+    // Custom matching: a pre-existing password account with the same verified
+    // email is linked in place, preserving its kit, onboarding and avatar.
+    if (!user.googleSubject) {
+      const [linked] = await db
+        .update(users)
+        .set({ googleSubject: profile.sub, updatedAt: new Date() })
+        .where(eq(users.id, user.id))
+        .returning()
+      if (linked) user = linked
+    }
+  }
+
+  await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id))
+  if (created) {
+    await recordActivity({
+      userId: user.id,
+      kind: 'account_created',
+      text: 'Welcome to Job Hunters — your den is ready.',
+    })
+  }
+  logger.info({ userId: user.id, created }, 'signed in with Google')
+  return issueSession(user, context)
 }
 
 async function issueSession(user: User, context: RequestContext): Promise<AuthSession> {

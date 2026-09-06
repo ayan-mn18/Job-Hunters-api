@@ -9,7 +9,7 @@
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/copy-skill-assets.mjs",
     "start": "node dist/index.js",
     "worker": "node dist/worker.js",
     "worker:dev": "tsx watch src/worker.ts",
@@ -24,7 +24,11 @@
     "runner": "node dist/runner.js",
     "runner:dev": "tsx watch src/runner.ts",
     "queue:smoke": "tsx src/scripts/queue-smoke.ts",
-    "apply:dry-run": "tsx src/scripts/dry-run.ts"
+    "apply:dry-run": "tsx src/scripts/dry-run.ts",
+    "skills:check": "tsx src/scripts/check-skills.ts",
+    "browser:verify": "tsx src/scripts/verify-browser.ts",
+    "skills:source": "tsx src/scripts/verify-skill-source.ts",
+    "agent:verify": "tsx src/scripts/verify-agent.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.122.0",
@@ -32,6 +36,7 @@
     "@supabase/supabase-js": "^2.58.0",
     "bullmq": "^6.0.9",
     "cors": "^2.8.5",
+    "dodopayments": "^2.49.0",
     "dotenv": "^17.2.3",
     "drizzle-orm": "^0.45.2",
     "express": "^5.1.0",

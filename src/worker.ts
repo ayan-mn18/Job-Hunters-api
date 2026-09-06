@@ -12,6 +12,7 @@ import { syncAllSchedules } from './queues/schedule.js'
 import { type InboxJobData } from './queues/names.js'
 import { sweepInbox } from './inbox/ingest.js'
 import { sourceFor } from './inbox/registry.js'
+import { closeApplicationQueue, reconcileInterruptedApplications } from './hunt/application-queue.js'
 import { db } from './db/client.js'
 import { userSchedules } from './db/schema.js'
 import { eq } from 'drizzle-orm'
@@ -36,6 +37,16 @@ if (!hasRedis) {
 
 registerQueueImplementations()
 startDiscoverWorker()
+
+// Application jobs use a separate browser runner, but their durable state
+// still needs repair when either process restarts.
+void reconcileInterruptedApplications()
+  .then((repaired) => {
+    if (repaired > 0) logger.info({ repaired }, 'repaired interrupted application attempts')
+  })
+  .catch((error: unknown) => {
+    logger.error({ err: error }, 'could not reconcile interrupted applications')
+  })
 
 // Learning runs on its own queue so a long refit cannot delay a scrape.
 startWorker(
@@ -103,6 +114,7 @@ async function shutdown(signal: string): Promise<void> {
 
   try {
     await closeQueues()
+    await closeApplicationQueue()
     await closeRedis()
     await closeDatabase()
   } catch (error) {

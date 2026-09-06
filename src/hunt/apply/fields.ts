@@ -7,6 +7,7 @@ import { hasModelAccess } from '../../config/env.js'
 import { logger } from '../../lib/logger.js'
 import { structured } from '../../model/gateway.js'
 import type { PortalProfile } from '../portal-profile.js'
+import { normaliseHttpUrl } from './urls.js'
 
 /**
  * Working out what a form field is asking, and what to put in it.
@@ -20,7 +21,7 @@ import type { PortalProfile } from '../portal-profile.js'
  * is answered once and answered instantly forever after.
  */
 
-export type Rung = 'recipe' | 'heuristic' | 'cache' | 'model' | 'skipped'
+export type Rung = 'recipe' | 'heuristic' | 'cache' | 'model' | 'agent' | 'skipped'
 
 export interface FormField {
   /** The label as the form wrote it. */
@@ -169,9 +170,9 @@ export function valueFromProfile(key: string, profile: PortalProfile): string | 
     lastName: parts.slice(1).join(' '),
     email: profile.email,
     phone: profile.phone,
-    linkedin: profile.links.linkedin,
-    github: profile.links.github,
-    portfolio: profile.links.portfolio,
+    linkedin: normaliseHttpUrl(profile.links.linkedin),
+    github: normaliseHttpUrl(profile.links.github),
+    portfolio: normaliseHttpUrl(profile.links.portfolio),
     addressLine1: profile.address.line1,
     city: profile.address.city,
     region: profile.address.region,

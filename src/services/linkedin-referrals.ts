@@ -9,6 +9,8 @@ import { hasPortalCredentialVault } from '../config/env.js'
 import { db } from '../db/client.js'
 import { portalAccounts, referrals, type PortalAccount } from '../db/schema.js'
 import { launchAutomationBrowser, launchInteractiveAutomationContext } from '../hunt/browser.js'
+import { openSession, type AgentSession } from '../browser/session.js'
+import { linkedinManifest } from '../skills/linkedin/manifest.js'
 import { conflict, notFound, serviceUnavailable } from '../lib/errors.js'
 import { decryptCredential, encryptCredential } from '../lib/credential-vault.js'
 import { logger } from '../lib/logger.js'
@@ -775,18 +777,52 @@ export async function syncLinkedInReferrals(
   if (syncingUsers.has(userId)) throw conflict('LinkedIn referral sync is already running.')
   const account = await loadAccount(userId)
   if (!account) throw notFound('Connect LinkedIn before syncing referrals.')
-  if (account.status !== 'ready' || !account.encryptedCredentials) {
+  if (account.status !== 'ready') {
     throw conflict(account.actionRequired || 'LinkedIn connection is not ready.')
   }
-  const credential = await decryptCredential<LinkedInSessionCredential>(
-    userId,
-    account.encryptedCredentials,
-  )
-  if (credential.kind !== 'linkedin-storage-state') throw conflict('Stored LinkedIn session is invalid.')
+
+  /**
+   * Two ways a LinkedIn login can exist here.
+   *
+   * A hosted profile is the current one: the cookies live with the browser and
+   * refresh themselves on every visit. A `storageState` blob in
+   * `encrypted_credentials` is how accounts were connected before profiles, and
+   * it is still honoured — those users should not have to reconnect on the day
+   * this ships. New connections only ever produce a profile.
+   */
+  const profileId = account.browserProfileId
+  let credential: LinkedInSessionCredential | null = null
+  if (!profileId) {
+    if (!account.encryptedCredentials) {
+      throw conflict(account.actionRequired || 'LinkedIn connection is not ready.')
+    }
+    credential = await decryptCredential<LinkedInSessionCredential>(
+      userId,
+      account.encryptedCredentials,
+    )
+    if (credential.kind !== 'linkedin-storage-state') {
+      throw conflict('Stored LinkedIn session is invalid.')
+    }
+  }
 
   syncingUsers.add(userId)
-  const browser = await launchAutomationBrowser()
-  const context = await browser.newContext({ storageState: credential.storageState })
+  let hosted: AgentSession | null = null
+  let browser: Awaited<ReturnType<typeof launchAutomationBrowser>> | null = null
+  if (profileId) {
+    hosted = await openSession({
+      userId,
+      label: 'linkedin-referrals',
+      profileId,
+      proxyCountry: linkedinManifest.proxyCountry,
+    })
+  } else {
+    browser = await launchAutomationBrowser()
+  }
+  const context = hosted
+    ? hosted.context
+    : await (browser as NonNullable<typeof browser>).newContext({
+        storageState: (credential as LinkedInSessionCredential).storageState,
+      })
   try {
     const page = await context.newPage()
     await page.goto('https://www.linkedin.com/messaging/', {
@@ -854,14 +890,19 @@ export async function syncLinkedInReferrals(
     }
 
     const syncedAt = new Date()
-    const freshState = await context.storageState()
+    // A hosted profile keeps its own cookies current, so there is nothing to
+    // write back. The legacy path has to re-capture the state or it ages out.
     await updateAccount(userId, {
       email: account.email,
       externalUserId: account.externalUserId,
-      encryptedCredentials: await encryptCredential<LinkedInSessionCredential>(userId, {
-        ...credential,
-        storageState: freshState,
-      }),
+      ...(credential
+        ? {
+            encryptedCredentials: await encryptCredential<LinkedInSessionCredential>(userId, {
+              ...credential,
+              storageState: await context.storageState(),
+            }),
+          }
+        : {}),
       status: 'ready',
       actionRequired: null,
       lastVerifiedAt: syncedAt,
@@ -884,8 +925,13 @@ export async function syncLinkedInReferrals(
     }
   } finally {
     syncingUsers.delete(userId)
-    await context.close().catch(() => undefined)
-    await browser.close().catch(() => undefined)
+    if (hosted) {
+      // Also stops the hosted browser; disconnecting alone leaves it billing.
+      await hosted.close()
+    } else {
+      await context.close().catch(() => undefined)
+      await browser?.close().catch(() => undefined)
+    }
   }
 }
 

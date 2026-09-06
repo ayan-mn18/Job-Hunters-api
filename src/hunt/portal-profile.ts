@@ -4,6 +4,7 @@ import { employments, kits, resumes } from '../db/schema.js'
 import { badRequest } from '../lib/errors.js'
 import { readParsedResume } from '../services/resume-parser.js'
 import { resumeDocumentSchema, type ResumeDocument } from './resume-document.js'
+import { normaliseHttpUrl } from './apply/urls.js'
 
 export interface PortalProfile {
   fullName: string
@@ -78,9 +79,9 @@ export async function loadPortalProfile(userId: string): Promise<PortalProfile> 
       country: kit.country ?? '',
     },
     links: {
-      linkedin: kit.linkedinUrl ?? '',
-      github: kit.githubUrl ?? '',
-      portfolio: kit.portfolioUrl ?? '',
+      linkedin: normaliseHttpUrl(kit.linkedinUrl ?? ''),
+      github: normaliseHttpUrl(kit.githubUrl ?? ''),
+      portfolio: normaliseHttpUrl(kit.portfolioUrl ?? ''),
     },
     noticePeriod: kit.noticePeriod ?? '',
     currentCtc: kit.currentCtc ?? '',

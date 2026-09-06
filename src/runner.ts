@@ -1,6 +1,6 @@
 import { hasRedis, env } from './config/env.js'
 import { closeDatabase } from './db/client.js'
-import { closeApplicationQueue, startApplicationWorker } from './hunt/application-queue.js'
+import { closeApplicationQueue, reconcileInterruptedApplications, startApplicationWorker } from './hunt/application-queue.js'
 import { logger } from './lib/logger.js'
 import { closeRedis } from './lib/redis.js'
 import { closeQueues, startWorker } from './queues/index.js'
@@ -10,8 +10,9 @@ import { withUserResourceLock } from './lib/locks.js'
 import { syncLinkedInReferrals } from './services/linkedin-referrals.js'
 import { getQueue } from './queues/index.js'
 import { markSent, nextSendable, pacingDelayMs, tripBreaker } from './outreach/sequence.js'
-import { CheckpointError, sendInvite, sendMessage } from './outreach/send.js'
-import { NoLinkedInSessionError, openLinkedInSession } from './outreach/session.js'
+import { CheckpointError } from './skills/linkedin/send.js'
+import { send as sendOnLinkedIn } from './skills/linkedin/outreach.js'
+import { NoLinkedInSessionError, openLinkedInSession } from './skills/linkedin/session.js'
 import { sweepOutreachTargets } from './outreach/sweep.js'
 
 /**
@@ -44,7 +45,11 @@ registerQueueImplementations()
 // configuration — concurrency, portal locks and pacing that are tuned and
 // tested. It keeps them.
 startApplicationWorker()
-logger.info({ queue: QUEUE.apply, concurrency: 3 }, 'worker started')
+logger.info({ queue: QUEUE.apply, concurrency: env.RUNNER_APPLY_CONCURRENCY }, 'worker started')
+
+void reconcileInterruptedApplications().catch((error: unknown) => {
+  logger.error({ err: error }, 'could not reconcile interrupted applications in runner')
+})
 
 startWorker<ReferralSyncJobData>(
   QUEUE.referralSync,
@@ -101,10 +106,7 @@ startWorker<OutreachJobData>(
       let session: Awaited<ReturnType<typeof openLinkedInSession>> | undefined
       try {
         session = await openLinkedInSession(userId)
-        const result =
-          message.kind === 'invite'
-            ? await sendInvite(session.context, message)
-            : await sendMessage(session.context, message)
+        const result = await sendOnLinkedIn(session, message)
 
         await markSent(userId, message, result.ok ? { ok: true } : { ok: false, error: result.error ?? 'unknown' })
         logger.info(

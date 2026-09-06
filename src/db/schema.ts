@@ -146,6 +146,8 @@ export const users = pgTable(
   {
     id: uuid('id').primaryKey().defaultRandom(),
     email: text('email').notNull(),
+    /** Google OIDC subject. Email remains the fallback link for old accounts. */
+    googleSubject: text('google_subject'),
     passwordHash: text('password_hash').notNull(),
     name: text('name').notNull(),
     /** Emoji the UI shows as the avatar. Picked at signup, editable later. */
@@ -161,6 +163,7 @@ export const users = pgTable(
     // Case-insensitive uniqueness. Emails are stored lowercased by the service
     // layer as well; this index is the backstop.
     uniqueIndex('users_email_lower_idx').on(sql`lower(${table.email})`),
+    uniqueIndex('users_google_subject_idx').on(table.googleSubject),
   ],
 )
 
@@ -589,6 +592,15 @@ export const portalAccounts = pgTable(
     encryptedCredentials: text('encrypted_credentials'),
     status: portalAccountStatusEnum('status').notNull().default('absent'),
     externalUserId: text('external_user_id'),
+    /**
+     * The hosted browser profile holding this portal's login.
+     *
+     * Replaces storing a `storageState` blob in `encrypted_credentials`: the
+     * cookies live with the browser that will use them, they refresh on every
+     * visit instead of going stale the week after they were captured, and this
+     * column is a reference rather than a secret.
+     */
+    browserProfileId: text('browser_profile_id'),
     actionRequired: text('action_required'),
     lastVerifiedAt: timestamp('last_verified_at', { withTimezone: true }),
     profileSyncedAt: timestamp('profile_synced_at', { withTimezone: true }),
@@ -613,6 +625,10 @@ export const applyAttempts = pgTable(
     submittedFields: jsonb('submitted_fields'),
     unresolvedFields: jsonb('unresolved_fields'),
     evidenceStoragePath: text('evidence_storage_path'),
+    /** Where a human can watch this attempt, and take it over. */
+    liveUrl: text('live_url'),
+    /** The hosted browser session, kept for cost attribution after the fact. */
+    browserSessionId: text('browser_session_id'),
     error: text('error'),
     startedAt: timestamp('started_at', { withTimezone: true }),
     completedAt: timestamp('completed_at', { withTimezone: true }),
@@ -912,7 +928,7 @@ export const emailAccounts = pgTable(
     lastPolledAt: timestamp('last_polled_at', { withTimezone: true }),
     ...timestamps,
   },
-  (table) => [primaryKey({ columns: [table.userId, table.address] })],
+  (table) => [primaryKey({ columns: [table.userId] })],
 )
 
 /**

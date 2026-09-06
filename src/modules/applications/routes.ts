@@ -6,12 +6,15 @@ import {
   applicationEvents,
   applications,
   applicationStatusEnum,
+  applyAttempts,
+  huntCandidates,
   portals,
   type Application,
   type ApplicationStatus,
 } from '../../db/schema.js'
 import { badRequest, notFound } from '../../lib/errors.js'
 import { asyncHandler, created, ok, pathParam } from '../../lib/http.js'
+import { createSignedUrl } from '../../lib/storage.js'
 import { toRelativeLabel } from '../../lib/time.js'
 import { currentUser, requireAuth } from '../../middleware/auth.js'
 import { validate, validatedQuery } from '../../middleware/validate.js'
@@ -170,34 +173,74 @@ applicationsRouter.get(
             // (which have no appliedAt) falling back to when they were queued.
             [desc(sql`coalesce(${applications.appliedAt}, ${applications.queuedAt})`)]
 
-    const [rows, [totalRow], statusCounts] = await Promise.all([
-      db
-        .select()
-        .from(applications)
-        .where(where)
-        .orderBy(...orderBy)
-        .limit(query.limit)
-        .offset(query.offset),
-      db.select({ value: count() }).from(applications).where(where),
-      db
-        .select({ status: applications.status, value: count() })
-        .from(applications)
-        .where(eq(applications.userId, auth.id))
-        .groupBy(applications.status),
-    ])
+    type ApplicationListRow = {
+      application: Application
+      filtered_total: number
+      status_counts: Record<string, number>
+    }
 
-    const counts = Object.fromEntries(STATUSES.map((status) => [status, 0])) as Record<
-      ApplicationStatus,
-      number
-    >
-    for (const row of statusCounts) counts[row.status] = row.value
+    // Total and status counts used to be two extra round trips. Windowing the
+    // filtered total and calculating the unfiltered counts in a correlated
+    // subquery keeps the list, pagination metadata and filter chips in one
+    // query — important while the database is hosted several hundred ms away.
+    const rowsWithMeta = await db
+      .select({
+        application: applications,
+        filtered_total: sql<number>`count(*) over ()`,
+        status_counts: sql<Record<string, number>>`coalesce((
+          select json_object_agg(status, value)
+          from (
+            select ${applications.status} as status, count(*)::int as value
+            from ${applications}
+            where ${applications.userId} = ${auth.id}
+            group by ${applications.status}
+          ) as status_counts
+        ), '{}'::json)`,
+      })
+      .from(applications)
+      .where(where)
+      .orderBy(...orderBy)
+      .limit(query.limit)
+      .offset(query.offset)
+
+    let total = Number((rowsWithMeta[0] as ApplicationListRow | undefined)?.filtered_total ?? 0)
+    let statusCounts = (rowsWithMeta[0] as ApplicationListRow | undefined)?.status_counts ?? {}
+
+    // Preserve correct counts for an empty page (including a valid page beyond
+    // the end of the result set). This is the uncommon case, so it pays the
+    // extra query only when the one-query path has no row to carry metadata.
+    if (rowsWithMeta.length === 0) {
+      const metaResult = await db.execute(
+        sql<{ filtered_total: number; status_counts: Record<string, number> }>`
+          select
+            (select count(*)::int from ${applications} where ${where}) as filtered_total,
+            coalesce((
+              select json_object_agg(status, value)
+              from (
+                select ${applications.status} as status, count(*)::int as value
+                from ${applications}
+                where ${applications.userId} = ${auth.id}
+                group by ${applications.status}
+              ) as status_counts
+            ), '{}'::json) as status_counts
+        `,
+      )
+      const meta = metaResult.rows[0] as
+        | { filtered_total?: number; status_counts?: Record<string, number> }
+        | undefined
+      total = Number(meta?.filtered_total ?? 0)
+      statusCounts = meta?.status_counts ?? {}
+    }
+
+    const counts: Record<string, number> = Object.fromEntries(STATUSES.map((status) => [status, 0]))
+    for (const [status, value] of Object.entries(statusCounts)) counts[status] = Number(value)
 
     const now = new Date()
     ok(
       res,
-      rows.map((row) => serializeApplication(row, now)),
+      rowsWithMeta.map((row) => serializeApplication(row.application, now)),
       {
-        total: totalRow?.value ?? 0,
+        total,
         limit: query.limit,
         offset: query.offset,
         // Counts are unfiltered on purpose: the filter chips show how many
@@ -247,6 +290,63 @@ applicationsRouter.get(
         at: event.createdAt.toISOString(),
         atLabel: toRelativeLabel(event.createdAt),
       })),
+    })
+  }),
+)
+
+/**
+ * What Hunty actually saw, for a `needs_review` application.
+ *
+ * `applications` and `apply_attempts` have no direct foreign key — both are
+ * written from the same `candidateId` inside one apply run, but that pairing
+ * is never persisted. This reconstructs it via the hunt candidate the
+ * application and the attempt each point back to.
+ */
+applicationsRouter.get(
+  '/:id/review',
+  validate({ params: idParamSchema }),
+  asyncHandler(async (req, res) => {
+    const auth = currentUser(req)
+
+    const [application] = await db
+      .select()
+      .from(applications)
+      .where(and(eq(applications.id, pathParam(req, 'id')), eq(applications.userId, auth.id)))
+      .limit(1)
+    if (!application) throw notFound('Application not found')
+
+    if (!application.jobId || !application.huntRunId) {
+      return ok(res, { attemptId: null, reason: null, unresolvedFields: [], evidenceUrl: null })
+    }
+
+    const [candidate] = await db
+      .select({ id: huntCandidates.id })
+      .from(huntCandidates)
+      .where(and(
+        eq(huntCandidates.jobId, application.jobId),
+        eq(huntCandidates.runId, application.huntRunId),
+        eq(huntCandidates.userId, auth.id),
+      ))
+      .limit(1)
+
+    const [attempt] = candidate
+      ? await db
+          .select()
+          .from(applyAttempts)
+          .where(and(eq(applyAttempts.candidateId, candidate.id), eq(applyAttempts.userId, auth.id)))
+          .orderBy(desc(applyAttempts.createdAt))
+          .limit(1)
+      : []
+
+    if (!attempt) {
+      return ok(res, { attemptId: null, reason: null, unresolvedFields: [], evidenceUrl: null })
+    }
+
+    ok(res, {
+      attemptId: attempt.id,
+      reason: attempt.error,
+      unresolvedFields: attempt.unresolvedFields ?? [],
+      evidenceUrl: attempt.evidenceStoragePath ? await createSignedUrl(attempt.evidenceStoragePath) : null,
     })
   }),
 )

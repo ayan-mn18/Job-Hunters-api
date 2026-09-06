@@ -2,17 +2,19 @@ import crypto from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { Redis } from 'ioredis'
 import { Queue, Worker, type Job as BullJob } from 'bullmq'
-import { and, count, eq, inArray, notInArray } from 'drizzle-orm'
+import { and, count, eq, inArray, lt, notInArray, sql } from 'drizzle-orm'
 import { env, hasRedis } from '../config/env.js'
 import { db } from '../db/client.js'
-import { huntCandidates, huntRunJobs, huntRuns } from '../db/schema.js'
+import { applications, applyAttempts, huntCandidates, huntRunJobs, huntRuns } from '../db/schema.js'
 import { serviceUnavailable } from '../lib/errors.js'
 import { logger } from '../lib/logger.js'
+import { stopBrowser } from '../browser/client.js'
 import { applyApprovedCandidate } from './apply.js'
 
 const QUEUE_NAME = 'hunt-apply'
 const APPLY_WINDOW_MS = 11 * 60 * 60 * 1000
 const MAX_DAILY_APPLICATIONS = 100
+const INTERRUPTED_AFTER_MS = 3 * 60_000
 const DEFAULT_PORTAL_CAP = 30
 const PORTAL_CAPS: Record<string, number> = {
   greenhouse: 35,
@@ -197,6 +199,169 @@ async function finishRunWhenSettled(job: BullJob<ApplyJobData>): Promise<void> {
     .where(eq(huntRuns.id, job.data.runId))
 }
 
+/**
+ * A queue job can disappear after its database writes have begun — for
+ * example when the browser runner is killed between creating an attempt and
+ * opening a session. Discovery already has this recovery path; application
+ * work needs the same one or the dashboard can report "applying" forever.
+ */
+export async function reconcileInterruptedApplications(): Promise<number> {
+  const cutoff = new Date(Date.now() - INTERRUPTED_AFTER_MS)
+  const jobs = await applicationQueue().getJobs(['active', 'waiting', 'delayed'])
+  const liveJobs = new Set(jobs.map((job) => `${job.data.runId}:${job.data.candidateId}`))
+  const stale = await db
+    .select({
+      candidateId: huntCandidates.id,
+      userId: huntCandidates.userId,
+      runId: huntCandidates.runId,
+      jobId: huntCandidates.jobId,
+      candidateStatus: huntCandidates.status,
+      attemptId: applyAttempts.id,
+      browserSessionId: applyAttempts.browserSessionId,
+    })
+    .from(huntCandidates)
+    .innerJoin(huntRuns, eq(huntRuns.id, huntCandidates.runId))
+    .leftJoin(
+      applyAttempts,
+      and(
+        eq(applyAttempts.candidateId, huntCandidates.id),
+        inArray(applyAttempts.status, ['pending', 'submitting']),
+      ),
+    )
+    .where(and(
+      eq(huntRuns.status, 'applying'),
+      inArray(huntCandidates.status, ['queued', 'applying']),
+      lt(huntCandidates.updatedAt, cutoff),
+    ))
+
+  const repairedRuns = new Set<string>()
+  let repaired = 0
+  for (const row of stale) {
+    if (liveJobs.has(`${row.runId}:${row.candidateId}`)) continue
+
+    const [updatedCandidate] = await db
+      .update(huntCandidates)
+      .set({ status: 'needs_review', updatedAt: new Date() })
+      .where(and(
+        eq(huntCandidates.id, row.candidateId),
+        inArray(huntCandidates.status, ['queued', 'applying']),
+      ))
+      .returning({ id: huntCandidates.id })
+    if (!updatedCandidate) continue
+
+    if (row.attemptId) {
+      await db
+        .update(applyAttempts)
+        .set({
+          status: 'unknown',
+          error: 'Application worker stopped before this attempt completed.',
+          completedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(applyAttempts.id, row.attemptId))
+    }
+    if (row.browserSessionId) {
+      await stopBrowser(row.browserSessionId).catch((error: unknown) => {
+        logger.warn({ err: error, sessionId: row.browserSessionId }, 'could not stop an interrupted browser session')
+      })
+    }
+    await db
+      .update(applications)
+      .set({ status: 'needs_review', updatedAt: new Date() })
+      .where(and(
+        eq(applications.userId, row.userId),
+        eq(applications.jobId, row.jobId),
+        eq(applications.status, 'queued'),
+      ))
+    await db
+      .update(huntRunJobs)
+      .set({ status: 'needs_review', updatedAt: new Date() })
+      .where(and(eq(huntRunJobs.runId, row.runId), eq(huntRunJobs.jobId, row.jobId)))
+    await db
+      .update(huntRuns)
+      .set({
+        applicationsNeedsReview: sql`${huntRuns.applicationsNeedsReview} + 1`,
+        updatedAt: new Date(),
+      })
+      .where(eq(huntRuns.id, row.runId))
+
+    repairedRuns.add(row.runId)
+    repaired += 1
+    logger.warn({ runId: row.runId, candidateId: row.candidateId, candidateStatus: row.candidateStatus }, 'repaired an interrupted application')
+  }
+
+  for (const runId of repairedRuns) {
+    const [active] = await db
+      .select({ value: count() })
+      .from(huntCandidates)
+      .where(and(
+        eq(huntCandidates.runId, runId),
+        inArray(huntCandidates.status, ['approved', 'tailored', 'queued', 'applying']),
+      ))
+    if ((active?.value ?? 0) === 0) {
+      await db
+        .update(huntRuns)
+        .set({
+          status: 'failed',
+          error: 'Application worker stopped before this hunt finished. Review the interrupted applications before retrying.',
+          finishedAt: new Date(),
+          progress: { stage: 'failed', reason: 'application_worker_interrupted' },
+          updatedAt: new Date(),
+        })
+        .where(and(eq(huntRuns.id, runId), eq(huntRuns.status, 'applying')))
+    }
+  }
+
+  return repaired
+}
+
+async function handleFailedApplicationJob(job: BullJob<ApplyJobData>, error: Error): Promise<void> {
+  const [candidate] = await db
+    .select({ id: huntCandidates.id, runId: huntCandidates.runId, userId: huntCandidates.userId, jobId: huntCandidates.jobId })
+    .from(huntCandidates)
+    .where(and(eq(huntCandidates.id, job.data.candidateId), eq(huntCandidates.userId, job.data.userId)))
+    .limit(1)
+  if (candidate) {
+    await db
+      .update(applyAttempts)
+      .set({
+        status: 'unknown',
+        error: `Application job failed before completion: ${error.message}`,
+        completedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(applyAttempts.candidateId, candidate.id),
+        inArray(applyAttempts.status, ['pending', 'submitting']),
+      ))
+    const [updated] = await db
+      .update(huntCandidates)
+      .set({ status: 'needs_review', updatedAt: new Date() })
+      .where(and(eq(huntCandidates.id, candidate.id), inArray(huntCandidates.status, ['queued', 'applying'])))
+      .returning({ id: huntCandidates.id })
+    if (updated) {
+      await db
+        .update(applications)
+        .set({ status: 'needs_review', updatedAt: new Date() })
+        .where(and(
+          eq(applications.userId, candidate.userId),
+          eq(applications.jobId, candidate.jobId),
+          eq(applications.status, 'queued'),
+        ))
+      await db
+        .update(huntRunJobs)
+        .set({ status: 'needs_review', updatedAt: new Date() })
+        .where(and(eq(huntRunJobs.runId, candidate.runId), eq(huntRunJobs.jobId, candidate.jobId)))
+      await db
+        .update(huntRuns)
+        .set({ applicationsNeedsReview: sql`${huntRuns.applicationsNeedsReview} + 1`, updatedAt: new Date() })
+        .where(eq(huntRuns.id, candidate.runId))
+    }
+  }
+  await finishRunWhenSettled(job)
+  logger.error({ err: error, jobId: job.id, candidateId: job.data.candidateId }, 'application job failed')
+}
+
 export function startApplicationWorker(): Worker<ApplyJobData> {
   const worker = new Worker<ApplyJobData>(
     QUEUE_NAME,
@@ -206,14 +371,19 @@ export function startApplicationWorker(): Worker<ApplyJobData> {
     },
     {
       connection: redis(),
-      concurrency: 3,
-      limiter: { max: 3, duration: 60_000 },
-      lockDuration: 120_000,
+      concurrency: env.RUNNER_APPLY_CONCURRENCY,
+      limiter: { max: env.RUNNER_APPLY_CONCURRENCY, duration: 60_000 },
+      // Hosted browser sessions can spend several minutes opening a portal,
+      // filling a form and waiting for a human takeover. The queue lock must
+      // cover that window or BullMQ will mark a healthy browser job stalled.
+      lockDuration: 15 * 60_000,
       maxStalledCount: 0,
     },
   )
   worker.on('failed', (job, error) => {
-    logger.error({ err: error, jobId: job?.id, candidateId: job?.data.candidateId }, 'application job failed')
+    if (job) void handleFailedApplicationJob(job, error).catch((recoveryError: unknown) => {
+      logger.error({ err: recoveryError, jobId: job.id, candidateId: job.data.candidateId }, 'could not reconcile a failed application job')
+    })
   })
   return worker
 }

@@ -3,7 +3,7 @@ import type { BrowserContext } from 'playwright-core'
 import { db } from '../db/client.js'
 import { employments, kits, outreachTargets, userSchedules } from '../db/schema.js'
 import { logger } from '../lib/logger.js'
-import { findProspects, type CandidateContext } from './find.js'
+import { findProspects, type CandidateContext } from '../skills/linkedin/find.js'
 import { discoverProspects } from './sequence.js'
 
 /**

@@ -91,7 +91,7 @@ export async function tripBreaker(userId: string, reason: string): Promise<void>
  * drift in the direction of sending *more*, and that is the one direction
  * that costs the user their account.
  */
-async function sentCounts(userId: string): Promise<{ today: number; week: number }> {
+export async function sentCounts(userId: string): Promise<{ today: number; week: number }> {
   const now = Date.now()
   const [row] = await db
     .select({
@@ -184,6 +184,12 @@ export interface SendableMessage {
   company: string
 }
 
+export interface NextSendableContext {
+  health: Awaited<ReturnType<typeof loadHealth>>
+  counts: { today: number; week: number }
+  schedule: { timezone: string; enabled: boolean } | undefined
+}
+
 /**
  * The next message that may actually be sent, or a reason why none may.
  *
@@ -194,14 +200,19 @@ export interface SendableMessage {
  */
 export async function nextSendable(
   userId: string,
+  context?: NextSendableContext,
 ): Promise<{ message: SendableMessage } | { blocked: string }> {
-  const health = await loadHealth(userId)
-  const counts = await sentCounts(userId)
-  const [schedule] = await db
-    .select({ timezone: userSchedules.timezone, enabled: userSchedules.outreachEnabled })
-    .from(userSchedules)
-    .where(eq(userSchedules.userId, userId))
-    .limit(1)
+  // The health screen already loads these snapshots. Reuse them so its
+  // response does not perform the same three reads twice.
+  const health = context?.health ?? (await loadHealth(userId))
+  const counts = context?.counts ?? (await sentCounts(userId))
+  const schedule =
+    context?.schedule ??
+    (await db
+      .select({ timezone: userSchedules.timezone, enabled: userSchedules.outreachEnabled })
+      .from(userSchedules)
+      .where(eq(userSchedules.userId, userId))
+      .limit(1))[0]
 
   if (!schedule?.enabled) return { blocked: 'Outbound referrals are switched off for this account.' }
 

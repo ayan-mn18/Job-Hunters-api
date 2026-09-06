@@ -3,6 +3,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { db } from '../../db/client.js'
 import {
+  applyAttempts,
   huntCandidates,
   huntRunJobs,
   huntRuns,
@@ -92,7 +93,8 @@ function serializeRun(row: HuntRun) {
   return {
     id: row.id,
     status: row.status,
-    running: ['queued', 'running', 'applying'].includes(row.status),
+    running: ['queued', 'running'].includes(row.status),
+    applying: row.status === 'applying',
     awaitingApproval: row.status === 'awaiting_approval',
     targetApplications: row.targetApplications,
     jobsScraped: row.jobsScraped,
@@ -332,12 +334,34 @@ huntRouter.get(
           .where(and(eq(huntCandidates.runId, latest.id), eq(huntCandidates.userId, auth.id)))
       : [{ value: 0 }]
 
+    // The one attempt actually in front of a browser right now, if any — the
+    // live view has nothing to show for a queued or already-finished one.
+    const [liveAttempt] = latest?.status === 'applying'
+      ? await db
+          .select({ id: applyAttempts.id, liveUrl: applyAttempts.liveUrl })
+          .from(applyAttempts)
+          .innerJoin(huntCandidates, eq(huntCandidates.id, applyAttempts.candidateId))
+          .where(and(
+            eq(huntCandidates.runId, latest.id),
+            eq(applyAttempts.userId, auth.id),
+            inArray(applyAttempts.status, ['pending', 'submitting']),
+          ))
+          .orderBy(desc(applyAttempts.startedAt))
+          .limit(1)
+      : []
+
     ok(res, {
-      running: latest ? ['queued', 'running', 'applying'].includes(latest.status) : false,
+      running: latest ? ['queued', 'running'].includes(latest.status) : false,
+      applying: latest?.status === 'applying',
       awaitingApproval,
       dailyTarget: spec.dailyTarget,
       currentRun: latest ? serializeRun(latest) : null,
       candidateCount: Number(candidateCount?.value ?? 0),
+      liveAttemptId: liveAttempt?.id ?? null,
+      // A hosted browser publishes a URL the user can open and click in. When
+      // it is null the live view falls back to streamed frames, which is what
+      // a locally launched browser can offer.
+      liveUrl: liveAttempt?.liveUrl ?? null,
       queueStubbed: false,
     })
   }),

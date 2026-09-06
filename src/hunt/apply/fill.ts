@@ -201,6 +201,14 @@ export interface SubmitResult {
   confirmation?: string
 }
 
+/** Whether the current recipe can see a usable submit control. */
+export async function hasSubmitControl(params: { page: Page; url: string }): Promise<boolean> {
+  const recipe = recipeFor(params.url)
+  const plan = recipe ?? { ...GENERIC, id: 'generic', matches: () => true }
+  const submit = params.page.locator(plan.submit).first()
+  return (await submit.count()) > 0 && (await submit.isVisible().catch(() => false))
+}
+
 /**
  * The last step, and the only irreversible one.
  *
@@ -224,7 +232,7 @@ export async function submitForm(params: {
   if (await postingIsClosed(page)) return { submitted: false, heldBack: 'posting_closed' }
 
   const submit = page.locator(plan.submit).first()
-  if ((await submit.count()) === 0 || !(await submit.isVisible().catch(() => false))) {
+  if (!(await hasSubmitControl({ page, url }))) {
     return { submitted: false, heldBack: 'no_submit_control' }
   }
 
