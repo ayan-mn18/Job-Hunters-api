@@ -33,10 +33,10 @@ services:
       PORT: 46460
       REDIS_URL: redis://redis:6379
       # Pool sizes are per process and the Supabase session pooler allows 15
-      # connections in total. Three services at the default 10 ask for 30 and
-      # get `EMAXCONNSESSION` under load. The API serves requests, so it takes
-      # the largest share.
-      DATABASE_POOL_MAX: 6
+      # connections in total, shared with other applications using the same
+      # project. Keep this stack at 5 possible connections (3 + 1 + 1) so a
+      # login or parallel dashboard load cannot exhaust the session pooler.
+      DATABASE_POOL_MAX: 3
     ports:
       - '127.0.0.1:46460:46460'
     depends_on:
@@ -52,7 +52,7 @@ services:
     environment:
       NODE_ENV: production
       REDIS_URL: redis://redis:6379
-      DATABASE_POOL_MAX: 4
+      DATABASE_POOL_MAX: 1
     depends_on:
       redis:
         condition: service_healthy
@@ -69,7 +69,7 @@ services:
       PORTAL_AUTOMATION_ENABLED: 'true'
       RUNNER_APPLY_CONCURRENCY: 1
       # The runner is browser-bound, not query-bound. It needs very few.
-      DATABASE_POOL_MAX: 3
+      DATABASE_POOL_MAX: 1
     # Chromium crashes on heavy pages with the default 64 MB /dev/shm. The
     # launch flags also pass --disable-dev-shm-usage; both together is belt and
     # braces, and cheap.
